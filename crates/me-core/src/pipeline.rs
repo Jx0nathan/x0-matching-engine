@@ -147,23 +147,38 @@ fn run_consumer(
         let target = current + 1;
         let available = strategy.wait_for(target, &cursor);
 
+        // Collect everything the disruptor delivered in this batch and submit
+        // them as one group — single WAL fsync amortised across the whole
+        // batch. This is the M3.3 group-commit win.
+        let mut batch_cmds: Vec<(Command, Timestamp)> = Vec::new();
+        let mut batch_responses: Vec<Option<SyncSender<CommandReceipt>>> = Vec::new();
+        let mut shutdown_at: Option<i64> = None;
+
         for seq in (current + 1)..=available {
-            // Extract everything we need from the slot, then drop the borrow
-            // before mutating the engine.
             let (cmd, ts, response, is_shutdown) = unsafe {
                 let slot = ring.slot(seq);
                 (slot.cmd.clone(), slot.ts, slot.response.clone(), slot.is_shutdown)
             };
-
             if is_shutdown {
-                my_seq.set(seq);
-                return engine;
+                shutdown_at = Some(seq);
+                break;
             }
+            batch_cmds.push((cmd, ts));
+            batch_responses.push(response);
+        }
 
-            let receipt = engine.submit(cmd, ts);
-            if let Some(tx) = response {
-                let _ = tx.send(receipt);
+        if !batch_cmds.is_empty() {
+            let receipts = engine.submit_batch(batch_cmds);
+            for (response, receipt) in batch_responses.into_iter().zip(receipts) {
+                if let Some(tx) = response {
+                    let _ = tx.send(receipt);
+                }
             }
+        }
+
+        if let Some(seq) = shutdown_at {
+            my_seq.set(seq);
+            return engine;
         }
 
         current = available;

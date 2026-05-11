@@ -34,6 +34,7 @@ anyhow = "1.0"
 ahash = { version = "0.8", features = ["serde"] }
 smallvec = { version = "1.13", features = ["serde"] }
 slab = { version = "0.4", features = ["serde"] }
+crc32fast = "1.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

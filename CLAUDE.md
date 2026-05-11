@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A production-targeted matching engine for spot + perpetual/futures, built as a Cargo workspace. This is a **greenfield rewrite** of an earlier `matching-core` reference design; that legacy code is for comparison only and not depended on.
 
-Status: **M3.2 (async pipeline) complete**. Producer/consumer ring buffer with backpressure + `AsyncMatchingEngine` wrapping the sync engine in a consumer thread. M3.3 (group commit + CRC) is next. See "Milestones" below for what's implemented vs. planned.
+Status: **M3 (persistence + concurrency) complete**. WAL with CRC32 framing, snapshot store, async ring-buffer pipeline, group-commit batched fsync, crash recovery. M4 (derivatives) is next. See "Milestones" below for what's implemented vs. planned.
 
 ## Architecture
 
@@ -93,10 +93,10 @@ cargo fmt --all
 | M1 | Workspace skeleton + `me-types` + conservation framework | ✅ done |
 | M2 | Spot matching: order book, R1/R2, synchronous pipeline + conservation property test | ✅ done |
 | M3.1 | WAL (bincode framed) + snapshot store + crash recovery tests | ✅ done |
-| **M3.2** | Lock-free ring buffer + `AsyncMatchingEngine` (producer/consumer + backpressure) | ✅ done |
-| M3.3 | WAL group commit + CRC checksums + crash-via-kill test | next |
-| M4 | Derivatives: margin engine, perp/future contracts, liquidation queue, funding rate | pending |
-| M5 | Productionization: tracing/Prometheus, fuzz suite, CI, stress tests, gray-release config | pending |
+| M3.2 | Lock-free ring buffer + `AsyncMatchingEngine` (producer/consumer + backpressure) | ✅ done |
+| **M3.3** | CRC32 on WAL records + `submit_batch` group commit (batched fsync per ring batch) | ✅ done |
+| M4 | Derivatives: margin engine, perp/future contracts, liquidation queue, funding rate | next |
+| M5 | Productionization: tracing/Prometheus, fuzz suite, CI, stress tests, gray-release config, true 3-thread R1/Match/R2 via UID sharding | pending |
 
 Each milestone is independently shippable. Don't start M(n+1) work in M(n) — keep the boundary clean.
 

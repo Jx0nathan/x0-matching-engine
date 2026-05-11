@@ -62,10 +62,15 @@ impl WalWriter {
         self.last_synced_seq
     }
 
+    /// Append one record. Record format: `[len u32][crc u32][payload]`.
+    /// The CRC32 (IEEE) covers only the payload bytes. Detects silent bit
+    /// corruption that bincode would otherwise quietly decode into garbage.
     pub fn append(&mut self, env: &CommandEnvelope) -> WalResult<()> {
         let bytes = bincode::serialize(env)?;
         let len = bytes.len() as u32;
+        let crc = crc32fast::hash(&bytes);
         self.file.write_all(&len.to_le_bytes())?;
+        self.file.write_all(&crc.to_le_bytes())?;
         self.file.write_all(&bytes)?;
         self.last_written_seq = env.seq_no;
         Ok(())
@@ -107,6 +112,7 @@ impl WalReader {
     /// Not named `next` to avoid shadowing `Iterator::next` — the signature
     /// here is `Result<Option<_>>`, not the iterator's `Option<_>`.
     pub fn read_next(&mut self) -> WalResult<Option<CommandEnvelope>> {
+        // Header: 4 bytes len, 4 bytes CRC.
         let mut len_buf = [0u8; 4];
         match self.file.read_exact(&mut len_buf) {
             Ok(()) => {}
@@ -114,25 +120,42 @@ impl WalReader {
             Err(e) => return Err(WalError::Io(e)),
         }
         let len = u32::from_le_bytes(len_buf) as usize;
-        // Sanity bound — a single command should never serialize beyond a few KB.
-        // 1 MiB is generous; anything larger is almost certainly garbage from a
-        // torn write or corruption.
         if len > 1024 * 1024 {
             return Err(WalError::Corrupt {
                 offset: self.offset,
                 message: format!("record length {} exceeds 1 MiB cap", len),
             });
         }
-        let mut data = vec![0u8; len];
-        match self.file.read_exact(&mut data) {
+        let mut crc_buf = [0u8; 4];
+        match self.file.read_exact(&mut crc_buf) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                // Torn write at tail. Treat as clean EOF.
+                // Torn write between len and crc. Treat as clean EOF.
                 return Ok(None);
             }
             Err(e) => return Err(WalError::Io(e)),
         }
-        self.offset += 4 + len as u64;
+        let expected_crc = u32::from_le_bytes(crc_buf);
+
+        let mut data = vec![0u8; len];
+        match self.file.read_exact(&mut data) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // Torn write within payload. Treat as clean EOF.
+                return Ok(None);
+            }
+            Err(e) => return Err(WalError::Io(e)),
+        }
+        self.offset += 4 + 4 + len as u64;
+
+        let actual_crc = crc32fast::hash(&data);
+        if actual_crc != expected_crc {
+            return Err(WalError::Corrupt {
+                offset: self.offset,
+                message: format!("crc mismatch: expected {expected_crc:#010x}, got {actual_crc:#010x}"),
+            });
+        }
+
         let env: CommandEnvelope = bincode::deserialize(&data).map_err(|e| WalError::Corrupt {
             offset: self.offset,
             message: format!("bincode: {}", e),
@@ -235,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_inner_record_errors() {
+    fn crc_mismatch_detected() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("wal.bin");
         {
@@ -243,16 +266,41 @@ mod tests {
             w.append(&env(1, 100)).unwrap();
             w.sync().unwrap();
         }
-        // Corrupt the body by zeroing it (length header survives, payload garbage).
+        // Flip a single byte deep in the payload (after the [len][crc] header)
+        // — CRC32 will catch this even if bincode would have silently decoded.
+        let mut f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(12)).unwrap(); // skip 4 len + 4 crc + first 4 payload
+        f.write_all(&[0xAAu8]).unwrap();
+        drop(f);
+
+        match read_all(&path) {
+            Err(WalError::Corrupt { message, .. }) => {
+                assert!(message.contains("crc mismatch"));
+            }
+            other => panic!("expected CRC mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zeroed_payload_caught_by_crc() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.bin");
+        {
+            let mut w = WalWriter::open(&path).unwrap();
+            w.append(&env(1, 100)).unwrap();
+            w.sync().unwrap();
+        }
+        // Zero everything after the length header. Without CRC the reader
+        // would attempt to bincode-decode garbage; with CRC the corruption
+        // is caught at the checksum step.
         let mut f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
         let total = f.metadata().unwrap().len();
         f.seek(SeekFrom::Start(4)).unwrap();
-        let zeros = vec![0xFFu8; (total - 4) as usize];
+        let zeros = vec![0x00u8; (total - 4) as usize];
         f.write_all(&zeros).unwrap();
         drop(f);
 
-        let result = read_all(&path);
-        assert!(matches!(result, Err(WalError::Corrupt { .. })));
+        assert!(matches!(read_all(&path), Err(WalError::Corrupt { .. })));
     }
 
     #[test]

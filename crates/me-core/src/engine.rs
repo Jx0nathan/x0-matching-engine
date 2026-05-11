@@ -151,12 +151,43 @@ impl MatchingEngine {
         let env = CommandEnvelope { seq_no, received_at: now, command: cmd };
 
         if let Some(wal) = &mut self.wal {
-            // Synchronous durability. M3.2 will batch sync via group commit.
             wal.append(&env).expect("WAL append failed");
             wal.sync().expect("WAL sync failed");
         }
 
         self.apply_envelope(&env)
+    }
+
+    /// Batched variant of `submit`: append all envelopes to the WAL, fsync
+    /// ONCE for the whole batch, then apply each in order. This amortises
+    /// the fsync cost over the batch — the canonical group-commit pattern.
+    ///
+    /// Durability invariant preserved: by the time any receipt is returned,
+    /// every record in the batch is on durable storage. (We fsync before
+    /// applying, so even an apply-time panic leaves the WAL ahead of state,
+    /// which is fine — restore replays the missed apply.)
+    pub fn submit_batch(
+        &mut self,
+        cmds: Vec<(Command, Timestamp)>,
+    ) -> Vec<CommandReceipt> {
+        if cmds.is_empty() {
+            return Vec::new();
+        }
+        let mut envs = Vec::with_capacity(cmds.len());
+        for (cmd, now) in cmds {
+            let seq_no = SeqNo(self.state.next_seq_no);
+            self.state.next_seq_no += 1;
+            envs.push(CommandEnvelope { seq_no, received_at: now, command: cmd });
+        }
+
+        if let Some(wal) = &mut self.wal {
+            for env in &envs {
+                wal.append(env).expect("WAL append failed");
+            }
+            wal.sync().expect("WAL sync failed");
+        }
+
+        envs.iter().map(|env| self.apply_envelope(env)).collect()
     }
 
     /// Apply an envelope to engine state. Used both for live submissions
@@ -557,5 +588,98 @@ mod tests {
         assert_eq!(last, SeqNo(1));
         eng.submit(Command::Nop, Timestamp(0));
         assert_eq!(eng.last_applied_seq(), SeqNo(2));
+    }
+
+    #[test]
+    fn submit_batch_matches_n_individual_submits() {
+        // Build the same scenario both ways and compare end state.
+        fn run<F: FnMut(&mut MatchingEngine, Vec<(Command, Timestamp)>)>(mut driver: F) -> MatchingEngine {
+            let mut eng = build_engine();
+            let t = Timestamp(0);
+            let cmds = vec![
+                (Command::AddUser(AddUser { user_id: UserId(1) }), t),
+                (Command::AddUser(AddUser { user_id: UserId(2) }), t),
+                (
+                    Command::AdjustBalance(AdjustBalance {
+                        user_id: UserId(1),
+                        currency_id: CurrencyId(1),
+                        delta: Amount(100_000_000),
+                        transaction_id: 0,
+                    }),
+                    t,
+                ),
+                (
+                    Command::AdjustBalance(AdjustBalance {
+                        user_id: UserId(2),
+                        currency_id: CurrencyId(2),
+                        delta: Amount(1_000_000_000),
+                        transaction_id: 1,
+                    }),
+                    t,
+                ),
+                (
+                    Command::PlaceOrder(PlaceOrder {
+                        user_id: UserId(1),
+                        symbol_id: SymbolId(1),
+                        client_order_id: ClientOrderId(1),
+                        side: Side::Ask,
+                        order_type: OrderType::Limit,
+                        time_in_force: TimeInForce::Gtc,
+                        price: Some(Price(50_000_000)),
+                        size: Size(100_000_000),
+                        reserve_price: None,
+                        stop_price: None,
+                        visible_size: None,
+                        self_trade_prevention: SelfTradePrevention::None,
+                    }),
+                    t,
+                ),
+                (
+                    Command::PlaceOrder(PlaceOrder {
+                        user_id: UserId(2),
+                        symbol_id: SymbolId(1),
+                        client_order_id: ClientOrderId(2),
+                        side: Side::Bid,
+                        order_type: OrderType::Limit,
+                        time_in_force: TimeInForce::Ioc,
+                        price: Some(Price(50_000_000)),
+                        size: Size(100_000_000),
+                        reserve_price: None,
+                        stop_price: None,
+                        visible_size: None,
+                        self_trade_prevention: SelfTradePrevention::None,
+                    }),
+                    t,
+                ),
+            ];
+            driver(&mut eng, cmds);
+            eng
+        }
+
+        let one_by_one = run(|eng, cmds| {
+            for (cmd, ts) in cmds {
+                eng.submit(cmd, ts);
+            }
+        });
+        let batched = run(|eng, cmds| {
+            eng.submit_batch(cmds);
+        });
+
+        for cur in [CurrencyId(1), CurrencyId(2)] {
+            assert_eq!(
+                one_by_one.risk().total_internal(cur),
+                batched.risk().total_internal(cur)
+            );
+        }
+        assert_eq!(one_by_one.last_applied_seq(), batched.last_applied_seq());
+    }
+
+    #[test]
+    fn submit_batch_empty_is_noop() {
+        let mut eng = build_engine();
+        let before = eng.last_applied_seq();
+        let receipts = eng.submit_batch(vec![]);
+        assert!(receipts.is_empty());
+        assert_eq!(eng.last_applied_seq(), before);
     }
 }
