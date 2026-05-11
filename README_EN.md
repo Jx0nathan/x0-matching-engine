@@ -4,7 +4,7 @@ English | [中文](./README.md)
 
 Production-targeted matching engine for spot + perpetual/futures, written in Rust.
 
-> **Status: M4.1 (derivatives - positions + isolated margin) complete.** `Position` lives in `UserAccount`, `HoldKind::Derivative` routes margin-aware pre-check and settlement for perp/future symbols. Open and increase positions work; close/flip/mark-price/liquidation come in M4.2. See `CLAUDE.md` for milestones.
+> **Status: M4.2 (derivatives - close/reduce + realized PnL) complete.** Derivative orders can now reduce or fully close existing positions; PnL realizes at the fill price and credits/debits free balance. Conservation is enforced via mark-to-market (`total_internal_with_marks`): at any fixed mark, the total stays invariant across every trade. M4.3 adds flip-in-one-order, liquidation, and funding. See `CLAUDE.md`.
 
 ## Design goals
 

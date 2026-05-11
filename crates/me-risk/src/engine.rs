@@ -117,11 +117,12 @@ impl RiskEngine {
         self.holds.get(&order_id)
     }
 
-    /// Sum across all users of (free + held + position margin in this currency).
-    /// Includes the exchange revenue account. Position margin is only counted
-    /// when its `margin_currency` matches — without this filter we'd
-    /// double-count a USDT position's margin into a BTC conservation total.
-    /// This is the conservation-test gate for M4 derivatives.
+    /// Sum across all users of free + held + position.margin_locked in this
+    /// currency. Realized-only — does NOT account for the mark-to-market
+    /// value of open positions. For spot-only systems this is enough; for
+    /// derivatives use `total_internal_with_marks` to also include unrealized
+    /// PnL, otherwise closes that realize profit appear as money created from
+    /// thin air (the counterparty's loss isn't booked until they close too).
     pub fn total_internal(&self, currency: CurrencyId) -> i128 {
         self.accounts
             .values()
@@ -133,6 +134,45 @@ impl RiskEngine {
                     .values()
                     .filter(|p| p.margin_currency == currency)
                     .map(|p| p.margin_locked.raw() as i128)
+                    .sum();
+                balance_part + position_part
+            })
+            .sum()
+    }
+
+    /// Conservation total including mark-to-market unrealized PnL.
+    /// `mark_for(symbol)` returns `Some((mark_price, base_minor_per_major))`
+    /// for each symbol with a current mark, `None` otherwise. Positions on
+    /// symbols without a mark contribute zero unrealized PnL.
+    ///
+    /// Invariant: for any fixed mark mapping, this total stays constant
+    /// across all engine operations (trades, fills, fees) modulo external
+    /// deposits/withdrawals.
+    pub fn total_internal_with_marks<F>(&self, currency: CurrencyId, mark_for: F) -> i128
+    where
+        F: Fn(SymbolId) -> Option<(Price, i64)>,
+    {
+        self.accounts
+            .values()
+            .map(|a| {
+                let balance_part =
+                    a.free(currency).raw() as i128 + a.held(currency).raw() as i128;
+                let position_part: i128 = a
+                    .positions
+                    .iter()
+                    .filter(|(_, p)| p.margin_currency == currency)
+                    .map(|(symbol_id, p)| {
+                        let margin = p.margin_locked.raw() as i128;
+                        let unrealized = match mark_for(*symbol_id) {
+                            Some((mark, scale)) if p.size.raw() != 0 && scale > 0 => {
+                                let diff =
+                                    (mark.raw() as i128) - (p.entry_price.raw() as i128);
+                                diff * (p.size.raw() as i128) / (scale as i128)
+                            }
+                            _ => 0,
+                        };
+                        margin + unrealized
+                    })
                     .sum();
                 balance_part + position_part
             })
@@ -264,8 +304,6 @@ impl RiskEngine {
         price: Price,
         order_id: OrderId,
     ) -> Result<(), RejectReason> {
-        // M4.1: opening / increasing positions only. Reduce/close/flip is
-        // routed through future Command::ClosePosition (M4.2).
         let account = self
             .accounts
             .get_mut(&cmd.user_id)
@@ -280,20 +318,31 @@ impl RiskEngine {
             Side::Bid => cmd.size.raw(),
             Side::Ask => -cmd.size.raw(),
         };
-        // Reject reverse-direction orders for M4.1.
-        if (current_signed > 0 && order_signed < 0) || (current_signed < 0 && order_signed > 0) {
+        // M4.2 supports reduce/close (opposite direction, |order| <= |current|).
+        // M4.2.beta will add flips (|order| > |current|). Reject flips for now.
+        let opposite_direction =
+            (current_signed > 0 && order_signed < 0) || (current_signed < 0 && order_signed > 0);
+        if opposite_direction && cmd.size.raw() > current_signed.unsigned_abs() as i64 {
             return Err(RejectReason::UnsupportedCommand);
         }
 
-        // Compute totals first (per-unit math truncates at small minor-unit scales).
         let total_notional = quote_amount(price, cmd.size, spec)
-            .ok_or(RejectReason::ArithmeticOverflow)?;
-        let reserve_margin = total_notional
-            .mul_bps_ceil(params.initial_margin_bps)
             .ok_or(RejectReason::ArithmeticOverflow)?;
         let reserve_fee = total_notional
             .mul_bps_ceil(spec.fee_schedule.taker_bps)
             .ok_or(RejectReason::ArithmeticOverflow)?;
+
+        let reserve_margin = if opposite_direction {
+            // Closing/reducing: margin will be RELEASED from the position at
+            // settle, not added. Don't reserve any here.
+            Amount::ZERO
+        } else {
+            // Opening/increasing: reserve the full order's worth of margin.
+            total_notional
+                .mul_bps_ceil(params.initial_margin_bps)
+                .ok_or(RejectReason::ArithmeticOverflow)?
+        };
+
         let to_lock = reserve_margin
             .checked_add(reserve_fee)
             .ok_or(RejectReason::ArithmeticOverflow)?;
@@ -488,35 +537,43 @@ impl RiskEngine {
             unreachable!("settle_derivative called on non-derivative hold");
         };
 
-        // Bid → positive contribution, Ask → negative.
         let contribution_signed: i64 = match hold.side {
             Side::Bid => trade.size.raw(),
             Side::Ask => -trade.size.raw(),
         };
 
-        // Proportional drawdown of the pre-check reserves for this fill size.
-        // Use i128 to avoid intermediate overflow on large reserves × size.
-        let reserved_margin_for_fill = Amount(
-            ((reserve_margin.raw() as i128) * (trade.size.raw() as i128)
-                / (original_size.raw() as i128)) as i64,
-        );
+        let prev_signed = self
+            .accounts
+            .get(&hold.user_id)
+            .ok_or(RejectReason::UnknownUser)?
+            .positions
+            .get(&hold.symbol_id)
+            .map(|p| p.size.raw())
+            .unwrap_or(0);
+        let is_reducing =
+            prev_signed != 0 && (prev_signed > 0) != (contribution_signed > 0);
+
+        // Proportional drawdown of fee from this order's reserve.
         let reserved_fee_for_fill = Amount(
             ((reserve_fee.raw() as i128) * (trade.size.raw() as i128)
+                / (original_size.raw() as i128)) as i64,
+        );
+        let reserved_margin_for_fill = Amount(
+            ((reserve_margin.raw() as i128) * (trade.size.raw() as i128)
                 / (original_size.raw() as i128)) as i64,
         );
         let reserved_total_for_fill = reserved_margin_for_fill
             .checked_add(reserved_fee_for_fill)
             .ok_or(RejectReason::ArithmeticOverflow)?;
 
-        // Actual fee at trade price using this user's fee rate.
         let fee_bps = if is_taker {
             spec.fee_schedule.taker_bps
         } else {
             spec.fee_schedule.maker_bps
         };
-        let actual_proceeds = quote_amount(trade.price, trade.size, spec)
+        let actual_notional = quote_amount(trade.price, trade.size, spec)
             .ok_or(RejectReason::ArithmeticOverflow)?;
-        let actual_fee = actual_proceeds
+        let actual_fee = actual_notional
             .mul_bps_ceil(fee_bps)
             .ok_or(RejectReason::ArithmeticOverflow)?;
 
@@ -525,69 +582,32 @@ impl RiskEngine {
             SymbolKindParams::Future(f) => f.initial_margin_bps,
             SymbolKindParams::Spot => unreachable!("settle_derivative on spot symbol"),
         };
-        let actual_margin = actual_proceeds
-            .mul_bps_ceil(imr_bps)
-            .ok_or(RejectReason::ArithmeticOverflow)?;
 
-        let actual_consumed = actual_margin
-            .checked_add(actual_fee)
-            .ok_or(RejectReason::ArithmeticOverflow)?;
-        // Slack: reserve was at order price, actual at trade price (Bid: trade ≤ order, Ask: trade ≥ order).
-        // For Bid the reserve overshoots → positive slack. For Ask the reserve can undershoot;
-        // saturating_sub means no negative-slack credit, but `actual_margin > reserved_margin_for_fill`
-        // on Ask is OK because additional margin can come from free balance (handled below if needed).
-        let slack = reserved_total_for_fill
-            .raw()
-            .saturating_sub(actual_consumed.raw());
-
-        {
-            let acct = self
-                .accounts
-                .get_mut(&hold.user_id)
-                .ok_or(RejectReason::UnknownUser)?;
-            acct.sub_from_hold(hold.currency, reserved_total_for_fill);
-            if slack > 0 {
-                acct.credit_free(hold.currency, Amount(slack));
-            }
-            // If actual_consumed > reserved (Ask side fills above limit), pull
-            // the difference from free balance.
-            if actual_consumed.raw() > reserved_total_for_fill.raw() {
-                let shortfall = Amount(actual_consumed.raw() - reserved_total_for_fill.raw());
-                if !acct.debit_free(hold.currency, shortfall) {
-                    return Err(RejectReason::InsufficientMargin);
-                }
-            }
-
-            let position = acct.position_mut_or_insert(hold.symbol_id);
-            let prev_signed = position.size.raw();
-            let prev_entry = position.entry_price.raw();
-            let prev_abs = prev_signed.unsigned_abs() as i64;
-            let new_signed = prev_signed + contribution_signed;
-
-            // M4.1 invariant: pre_check_derivative rejects reverse-direction orders,
-            // so prev_signed and contribution_signed have the same sign (or prev==0).
-            let new_entry = if new_signed == 0 {
-                0
-            } else if prev_signed == 0 {
-                trade.price.raw()
-            } else {
-                let prev_notional = (prev_abs as i128) * (prev_entry as i128);
-                let fill_notional = (trade.size.raw() as i128) * (trade.price.raw() as i128);
-                let new_abs = new_signed.unsigned_abs() as i128;
-                ((prev_notional + fill_notional) / new_abs) as i64
-            };
-            position.size = Size(new_signed);
-            position.entry_price = Price(new_entry);
-            position.margin_locked = Amount(position.margin_locked.raw() + actual_margin.raw());
-            position.margin_currency = hold.currency;
+        if is_reducing {
+            self.settle_derivative_reduce(
+                trade,
+                &mut hold,
+                contribution_signed,
+                actual_notional,
+                actual_fee,
+                reserved_total_for_fill,
+                imr_bps,
+                spec,
+            )?;
+        } else {
+            self.settle_derivative_open(
+                trade,
+                &mut hold,
+                contribution_signed,
+                actual_notional,
+                actual_fee,
+                reserved_total_for_fill,
+                imr_bps,
+                spec,
+            )?;
         }
 
-        let revenue = self
-            .accounts
-            .get_mut(&EXCHANGE_ACCOUNT)
-            .expect("exchange account missing");
-        revenue.credit_free(spec.quote_currency, actual_fee);
-
+        // Hold accounting.
         hold.remaining_amount = Amount(hold.remaining_amount.raw() - reserved_total_for_fill.raw());
         hold.remaining_size = Size(hold.remaining_size.raw() - trade.size.raw());
 
@@ -604,6 +624,164 @@ impl RiskEngine {
         } else {
             Ok(Some(hold))
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn settle_derivative_open(
+        &mut self,
+        trade: &Trade,
+        hold: &mut Hold,
+        contribution_signed: i64,
+        actual_notional: Amount,
+        actual_fee: Amount,
+        reserved_total_for_fill: Amount,
+        imr_bps: Bps,
+        spec: &SymbolSpec,
+    ) -> Result<(), RejectReason> {
+        let actual_margin = actual_notional
+            .mul_bps_ceil(imr_bps)
+            .ok_or(RejectReason::ArithmeticOverflow)?;
+        let actual_consumed = actual_margin
+            .checked_add(actual_fee)
+            .ok_or(RejectReason::ArithmeticOverflow)?;
+        let slack = reserved_total_for_fill
+            .raw()
+            .saturating_sub(actual_consumed.raw());
+
+        let acct = self
+            .accounts
+            .get_mut(&hold.user_id)
+            .ok_or(RejectReason::UnknownUser)?;
+        acct.sub_from_hold(hold.currency, reserved_total_for_fill);
+        if slack > 0 {
+            acct.credit_free(hold.currency, Amount(slack));
+        }
+        // Ask filling above the limit can leave actual_consumed > reserved.
+        if actual_consumed.raw() > reserved_total_for_fill.raw() {
+            let shortfall = Amount(actual_consumed.raw() - reserved_total_for_fill.raw());
+            if !acct.debit_free(hold.currency, shortfall) {
+                return Err(RejectReason::InsufficientMargin);
+            }
+        }
+
+        let position = acct.position_mut_or_insert(hold.symbol_id);
+        let prev_signed = position.size.raw();
+        let prev_entry = position.entry_price.raw();
+        let prev_abs = prev_signed.unsigned_abs() as i64;
+        let new_signed = prev_signed + contribution_signed;
+
+        let new_entry = if new_signed == 0 {
+            0
+        } else if prev_signed == 0 {
+            trade.price.raw()
+        } else {
+            let prev_notional = (prev_abs as i128) * (prev_entry as i128);
+            let fill_notional = (trade.size.raw() as i128) * (trade.price.raw() as i128);
+            let new_abs = new_signed.unsigned_abs() as i128;
+            ((prev_notional + fill_notional) / new_abs) as i64
+        };
+        position.size = Size(new_signed);
+        position.entry_price = Price(new_entry);
+        position.margin_locked = Amount(position.margin_locked.raw() + actual_margin.raw());
+        position.margin_currency = hold.currency;
+
+        let revenue = self
+            .accounts
+            .get_mut(&EXCHANGE_ACCOUNT)
+            .expect("exchange account missing");
+        revenue.credit_free(spec.quote_currency, actual_fee);
+        Ok(())
+    }
+
+    /// Settle a fill that reduces (or closes) a user's existing position.
+    /// Computes realized PnL at the fill price, releases proportional margin
+    /// from the position back to free, and pays the fee from the order's
+    /// reserve. M4.2 invariant: the order does not flip — pre_check rejects
+    /// orders whose size would exceed the current position magnitude.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_derivative_reduce(
+        &mut self,
+        trade: &Trade,
+        hold: &mut Hold,
+        contribution_signed: i64,
+        _actual_notional: Amount,
+        actual_fee: Amount,
+        reserved_total_for_fill: Amount,
+        _imr_bps: Bps,
+        spec: &SymbolSpec,
+    ) -> Result<(), RejectReason> {
+        let acct = self
+            .accounts
+            .get_mut(&hold.user_id)
+            .ok_or(RejectReason::UnknownUser)?;
+
+        // Drain the fee reserve from holds. Pay actual fee; slack to free;
+        // shortfall pulled from free.
+        acct.sub_from_hold(hold.currency, reserved_total_for_fill);
+        let slack = reserved_total_for_fill.raw().saturating_sub(actual_fee.raw());
+        if slack > 0 {
+            acct.credit_free(hold.currency, Amount(slack));
+        }
+        if actual_fee.raw() > reserved_total_for_fill.raw() {
+            let shortfall = Amount(actual_fee.raw() - reserved_total_for_fill.raw());
+            if !acct.debit_free(hold.currency, shortfall) {
+                return Err(RejectReason::InsufficientFunds);
+            }
+        }
+
+        let position = acct.position_mut_or_insert(hold.symbol_id);
+        let prev_signed = position.size.raw();
+        let prev_abs = prev_signed.unsigned_abs() as i64;
+        let prev_entry = position.entry_price.raw();
+        let prev_margin = position.margin_locked.raw();
+
+        // Closed amount is the contribution magnitude (validated <= |prev| at pre-check).
+        let closed = trade.size.raw();
+        let new_signed = prev_signed + contribution_signed;
+
+        // Realized PnL on closed_size:
+        //   long close (prev > 0): pnl = (fill_price - entry) × closed / scale
+        //   short close (prev < 0): pnl = (entry - fill_price) × closed / scale
+        let pnl_per_unit_i128: i128 = if prev_signed > 0 {
+            trade.price.raw() as i128 - prev_entry as i128
+        } else {
+            prev_entry as i128 - trade.price.raw() as i128
+        };
+        let pnl_i128 = pnl_per_unit_i128 * (closed as i128) / (spec.base_minor_per_major as i128);
+        let realized_pnl = pnl_i128 as i64;
+
+        // Release proportional margin from position back to free.
+        // released = prev_margin × closed / prev_abs.
+        let released = if prev_abs == 0 {
+            0
+        } else {
+            ((prev_margin as i128) * (closed as i128) / (prev_abs as i128)) as i64
+        };
+        let new_margin = prev_margin.saturating_sub(released);
+
+        position.size = Size(new_signed);
+        position.margin_locked = Amount(new_margin);
+        if new_signed == 0 {
+            position.entry_price = Price(0);
+        }
+        // entry_price unchanged for partial reduce.
+
+        // Apply PnL (signed) to free balance. May go negative (bankruptcy →
+        // liquidation in M4.3); for M4.2 we allow it and let conservation
+        // tests confirm money is still conserved at the engine level.
+        let acct = self
+            .accounts
+            .get_mut(&hold.user_id)
+            .ok_or(RejectReason::UnknownUser)?;
+        let quote_bal = acct.balances.entry(spec.quote_currency).or_insert(Amount::ZERO);
+        *quote_bal = Amount(quote_bal.raw() + released + realized_pnl);
+
+        let revenue = self
+            .accounts
+            .get_mut(&EXCHANGE_ACCOUNT)
+            .expect("exchange account missing");
+        revenue.credit_free(spec.quote_currency, actual_fee);
+        Ok(())
     }
 }
 
@@ -831,39 +1009,47 @@ mod tests {
     }
 
     #[test]
-    fn derivative_reverse_direction_rejected() {
+    fn derivative_flip_rejected_but_reduce_accepted() {
         let mut r = RiskEngine::new();
         let spec = spec_btc_perp();
         r.add_user(UserId(1)).unwrap();
+        r.add_user(UserId(99)).unwrap();
         deposit(&mut r, 1, CurrencyId(2), 10_000_000_000);
+        deposit(&mut r, 99, CurrencyId(2), 10_000_000_000);
 
-        // Open long.
+        // Open long size 50M.
         r.pre_check_place(&po(1, SymbolId(2), Side::Bid, 50_000_000, 50_000_000), &spec, OrderId(1))
             .unwrap();
-        let trade = Trade {
-            symbol_id: SymbolId(2),
-            price: Price(50_000_000),
-            size: Size(50_000_000),
-            taker_order_id: OrderId(1),
-            taker_user_id: UserId(1),
-            maker_order_id: OrderId(99),
-            maker_user_id: UserId(99),
-            taker_side: Side::Bid,
-            timestamp: Timestamp(0),
-        };
-        // No matching maker for this test; manually set up maker.
-        r.add_user(UserId(99)).unwrap();
-        deposit(&mut r, 99, CurrencyId(2), 10_000_000_000);
         r.pre_check_place(&po(99, SymbolId(2), Side::Ask, 50_000_000, 50_000_000), &spec, OrderId(99))
             .unwrap();
-        r.apply_trade(&trade, &spec).unwrap();
+        r.apply_trade(
+            &Trade {
+                symbol_id: SymbolId(2),
+                price: Price(50_000_000),
+                size: Size(50_000_000),
+                taker_order_id: OrderId(1),
+                taker_user_id: UserId(1),
+                maker_order_id: OrderId(99),
+                maker_user_id: UserId(99),
+                taker_side: Side::Bid,
+                timestamp: Timestamp(0),
+            },
+            &spec,
+        )
+        .unwrap();
 
-        // User 1 now has a long position. Submitting an Ask must be rejected.
+        // Reduce by 10M — same side as Ask, opposite of long position → OK.
+        r.pre_check_place(&po(1, SymbolId(2), Side::Ask, 51_000_000, 10_000_000), &spec, OrderId(2))
+            .unwrap();
+
+        // Flip attempt: 60M Ask on a 50M long (40M remaining after reduce).
+        // Current after reduce-hold: position still 50M long, free-margin reduced.
+        // Order size 60M > 50M current → flip → REJECT.
         let err = r
             .pre_check_place(
-                &po(1, SymbolId(2), Side::Ask, 51_000_000, 10_000_000),
+                &po(1, SymbolId(2), Side::Ask, 51_000_000, 60_000_000),
                 &spec,
-                OrderId(2),
+                OrderId(3),
             )
             .unwrap_err();
         assert_eq!(err, RejectReason::UnsupportedCommand);
@@ -919,6 +1105,217 @@ mod tests {
         assert_eq!(p2.size, Size(-50_000_000));
         assert_eq!(p1.entry_price, Price(50_000_000));
         assert_eq!(p2.entry_price, Price(50_000_000));
+    }
+
+    /// Helper: open a 50M long for U1 at price 50e6 by trading with U2.
+    fn open_50m_long_at_50(r: &mut RiskEngine, spec: &SymbolSpec) {
+        r.add_user(UserId(1)).unwrap();
+        r.add_user(UserId(2)).unwrap();
+        deposit(r, 1, CurrencyId(2), 10_000_000_000);
+        deposit(r, 2, CurrencyId(2), 10_000_000_000);
+        r.pre_check_place(&po(1, SymbolId(2), Side::Bid, 50_000_000, 50_000_000), spec, OrderId(1))
+            .unwrap();
+        r.pre_check_place(&po(2, SymbolId(2), Side::Ask, 50_000_000, 50_000_000), spec, OrderId(2))
+            .unwrap();
+        r.apply_trade(
+            &Trade {
+                symbol_id: SymbolId(2),
+                price: Price(50_000_000),
+                size: Size(50_000_000),
+                taker_order_id: OrderId(1),
+                taker_user_id: UserId(1),
+                maker_order_id: OrderId(2),
+                maker_user_id: UserId(2),
+                taker_side: Side::Bid,
+                timestamp: Timestamp(0),
+            },
+            spec,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn derivative_full_close_at_profit_realizes_pnl_and_resets_entry() {
+        let mut r = RiskEngine::new();
+        let spec = spec_btc_perp();
+        open_50m_long_at_50(&mut r, &spec);
+
+        let u1_before_quote = r.account(UserId(1)).unwrap().free(CurrencyId(2)).raw();
+        let u1_before_position_margin =
+            r.account(UserId(1)).unwrap().position(SymbolId(2)).unwrap().margin_locked.raw();
+
+        // U3 takes U1's close at higher price (60e6) → U1 closes at profit.
+        r.add_user(UserId(3)).unwrap();
+        deposit(&mut r, 3, CurrencyId(2), 10_000_000_000);
+        r.pre_check_place(&po(1, SymbolId(2), Side::Ask, 60_000_000, 50_000_000), &spec, OrderId(3))
+            .unwrap();
+        r.pre_check_place(&po(3, SymbolId(2), Side::Bid, 60_000_000, 50_000_000), &spec, OrderId(4))
+            .unwrap();
+        r.apply_trade(
+            &Trade {
+                symbol_id: SymbolId(2),
+                price: Price(60_000_000),
+                size: Size(50_000_000),
+                taker_order_id: OrderId(3),
+                taker_user_id: UserId(1),
+                maker_order_id: OrderId(4),
+                maker_user_id: UserId(3),
+                taker_side: Side::Ask,
+                timestamp: Timestamp(0),
+            },
+            &spec,
+        )
+        .unwrap();
+
+        let pos = r.account(UserId(1)).unwrap().position(SymbolId(2)).unwrap();
+        assert_eq!(pos.size, Size(0));
+        assert_eq!(pos.margin_locked, Amount(0));
+        assert_eq!(pos.entry_price, Price(0));
+
+        // Profit per unit at (60e6 - 50e6) × 50M / 100M = 5_000_000.
+        let u1_after_quote = r.account(UserId(1)).unwrap().free(CurrencyId(2)).raw();
+        let gained = u1_after_quote - u1_before_quote;
+        // Expected = margin returned + realized profit - fee.
+        // margin returned ≈ u1_before_position_margin
+        // realized profit = 5_000_000
+        // fee on notional 30_000_000 at 20bps (ceil) = 60_000
+        assert_eq!(gained, u1_before_position_margin + 5_000_000 - 60_000);
+    }
+
+    #[test]
+    fn derivative_partial_reduce_keeps_entry_and_releases_proportional_margin() {
+        let mut r = RiskEngine::new();
+        let spec = spec_btc_perp();
+        open_50m_long_at_50(&mut r, &spec);
+
+        let pos_before = r.account(UserId(1)).unwrap().position(SymbolId(2)).unwrap().clone();
+        let prev_margin = pos_before.margin_locked.raw();
+
+        // Reduce 20M of 50M long at price 55e6.
+        r.add_user(UserId(3)).unwrap();
+        deposit(&mut r, 3, CurrencyId(2), 10_000_000_000);
+        r.pre_check_place(&po(1, SymbolId(2), Side::Ask, 55_000_000, 20_000_000), &spec, OrderId(3))
+            .unwrap();
+        r.pre_check_place(&po(3, SymbolId(2), Side::Bid, 55_000_000, 20_000_000), &spec, OrderId(4))
+            .unwrap();
+        r.apply_trade(
+            &Trade {
+                symbol_id: SymbolId(2),
+                price: Price(55_000_000),
+                size: Size(20_000_000),
+                taker_order_id: OrderId(3),
+                taker_user_id: UserId(1),
+                maker_order_id: OrderId(4),
+                maker_user_id: UserId(3),
+                taker_side: Side::Ask,
+                timestamp: Timestamp(0),
+            },
+            &spec,
+        )
+        .unwrap();
+
+        let pos_after = r.account(UserId(1)).unwrap().position(SymbolId(2)).unwrap();
+        // Position size dropped to 30M, entry unchanged at 50e6.
+        assert_eq!(pos_after.size, Size(30_000_000));
+        assert_eq!(pos_after.entry_price, Price(50_000_000));
+        // Margin released proportionally: 20M / 50M = 40% of prev.
+        let expected_remaining_margin = prev_margin * 30 / 50;
+        // Allow a 1-unit rounding tolerance (integer truncation on division).
+        assert!(
+            (pos_after.margin_locked.raw() - expected_remaining_margin).abs() <= 1,
+            "expected ~{}, got {}",
+            expected_remaining_margin,
+            pos_after.margin_locked.raw()
+        );
+    }
+
+    #[test]
+    fn derivative_reduce_conserves_total_internal_with_marks() {
+        let mut r = RiskEngine::new();
+        let spec = spec_btc_perp();
+        open_50m_long_at_50(&mut r, &spec);
+
+        // Hold the mark fixed throughout — conservation must hold at any
+        // single mark price across the trade.
+        let mark = |sid: SymbolId| {
+            if sid == SymbolId(2) {
+                Some((Price(55_000_000), 100_000_000))
+            } else {
+                None
+            }
+        };
+
+        r.add_user(UserId(3)).unwrap();
+        deposit(&mut r, 3, CurrencyId(2), 10_000_000_000);
+
+        let total_before = r.total_internal_with_marks(CurrencyId(2), mark);
+
+        r.pre_check_place(&po(1, SymbolId(2), Side::Ask, 55_000_000, 20_000_000), &spec, OrderId(3))
+            .unwrap();
+        r.pre_check_place(&po(3, SymbolId(2), Side::Bid, 55_000_000, 20_000_000), &spec, OrderId(4))
+            .unwrap();
+        r.apply_trade(
+            &Trade {
+                symbol_id: SymbolId(2),
+                price: Price(55_000_000),
+                size: Size(20_000_000),
+                taker_order_id: OrderId(3),
+                taker_user_id: UserId(1),
+                maker_order_id: OrderId(4),
+                maker_user_id: UserId(3),
+                taker_side: Side::Ask,
+                timestamp: Timestamp(0),
+            },
+            &spec,
+        )
+        .unwrap();
+
+        // At a fixed mark, total (realized + unrealized + margin) is invariant
+        // across the trade. U1 realized +1M on the close, exactly offset by
+        // U2 (still open short) gaining an extra 1M of mark-to-market loss
+        // on the symmetric side.
+        let total_after = r.total_internal_with_marks(CurrencyId(2), mark);
+        assert_eq!(total_before, total_after);
+    }
+
+    #[test]
+    fn derivative_close_at_loss_debits_balance() {
+        let mut r = RiskEngine::new();
+        let spec = spec_btc_perp();
+        open_50m_long_at_50(&mut r, &spec);
+
+        let u1_before_quote = r.account(UserId(1)).unwrap().free(CurrencyId(2)).raw();
+        let u1_before_position_margin =
+            r.account(UserId(1)).unwrap().position(SymbolId(2)).unwrap().margin_locked.raw();
+
+        // Close at 40e6 (worse than 50e6 entry) → loss of 5M.
+        r.add_user(UserId(3)).unwrap();
+        deposit(&mut r, 3, CurrencyId(2), 10_000_000_000);
+        r.pre_check_place(&po(1, SymbolId(2), Side::Ask, 40_000_000, 50_000_000), &spec, OrderId(3))
+            .unwrap();
+        r.pre_check_place(&po(3, SymbolId(2), Side::Bid, 40_000_000, 50_000_000), &spec, OrderId(4))
+            .unwrap();
+        r.apply_trade(
+            &Trade {
+                symbol_id: SymbolId(2),
+                price: Price(40_000_000),
+                size: Size(50_000_000),
+                taker_order_id: OrderId(3),
+                taker_user_id: UserId(1),
+                maker_order_id: OrderId(4),
+                maker_user_id: UserId(3),
+                taker_side: Side::Ask,
+                timestamp: Timestamp(0),
+            },
+            &spec,
+        )
+        .unwrap();
+
+        let u1_after_quote = r.account(UserId(1)).unwrap().free(CurrencyId(2)).raw();
+        // Net = margin returned + (-5_000_000 loss) - fee.
+        // fee on notional 20_000_000 at 20bps = 40_000.
+        let net_change = u1_after_quote - u1_before_quote;
+        assert_eq!(net_change, u1_before_position_margin - 5_000_000 - 40_000);
     }
 
     #[test]
