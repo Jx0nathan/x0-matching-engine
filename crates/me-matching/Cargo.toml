@@ -1,0 +1,13 @@
+[package]
+name = "me-matching"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Order book and matching engine (filled in M2)"
+
+[dependencies]
+me-types = { workspace = true }
+ahash = { workspace = true }
+smallvec = { workspace = true }
+serde = { workspace = true }

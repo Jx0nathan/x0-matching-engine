@@ -1,0 +1,18 @@
+[package]
+name = "me-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Binary daemon (filled in M5)"
+
+[[bin]]
+name = "me-server"
+path = "src/main.rs"
+
+[dependencies]
+me-core = { workspace = true }
+me-types = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -1,0 +1,16 @@
+[package]
+name = "me-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Top-level facade that assembles the pipeline (filled in M2/M3)"
+
+[dependencies]
+me-types = { workspace = true }
+me-disruptor = { workspace = true }
+me-wal = { workspace = true }
+me-risk = { workspace = true }
+me-matching = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

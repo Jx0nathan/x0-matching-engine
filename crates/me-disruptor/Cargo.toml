@@ -1,0 +1,10 @@
+[package]
+name = "me-disruptor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Lock-free ring buffer + sequence barriers for the matching pipeline (filled in M3)"
+
+[dependencies]
+me-types = { workspace = true }

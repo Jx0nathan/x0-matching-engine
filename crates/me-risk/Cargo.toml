@@ -1,0 +1,13 @@
+[package]
+name = "me-risk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Risk engine: pre-trade balance checks and post-trade settlement (filled in M2)"
+
+[dependencies]
+me-types = { workspace = true }
+ahash = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }

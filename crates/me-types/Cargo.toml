@@ -1,0 +1,15 @@
+[package]
+name = "me-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Core types: fixed-point numerics, commands, events, symbol specs"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+smallvec = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
