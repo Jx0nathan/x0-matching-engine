@@ -220,12 +220,15 @@ dependencies = [
 name = "me-core"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "anyhow",
  "me-disruptor",
  "me-matching",
  "me-risk",
  "me-types",
  "me-wal",
+ "proptest",
+ "smallvec",
  "tracing",
 ]
 
@@ -243,6 +246,7 @@ dependencies = [
  "ahash",
  "me-types",
  "serde",
+ "slab",
  "smallvec",
 ]
 
@@ -533,6 +537,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
+]
+
+[[package]]
+name = "slab"
+version = "0.4.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

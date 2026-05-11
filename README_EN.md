@@ -4,7 +4,7 @@ English | [中文](./README.md)
 
 Production-targeted matching engine for spot + perpetual/futures, written in Rust.
 
-> **Status: M1 (skeleton).** Most crates are stubs. See `CLAUDE.md` for milestones.
+> **Status: M2 (spot matching working).** Engine + risk + conservation property test in place. M3 adds concurrency and persistence. See `CLAUDE.md` for milestones.
 
 ## Design goals
 
