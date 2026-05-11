@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A production-targeted matching engine for spot + perpetual/futures, built as a Cargo workspace. This is a **greenfield rewrite** of an earlier `matching-core` reference design; that legacy code is for comparison only and not depended on.
 
-Status: **M3 (persistence + concurrency) complete**. WAL with CRC32 framing, snapshot store, async ring-buffer pipeline, group-commit batched fsync, crash recovery. M4 (derivatives) is next. See "Milestones" below for what's implemented vs. planned.
+Status: **M4.1 (derivative positions + isolated margin) complete**. Position state in UserAccount, HoldKind::Derivative variant, opening/increasing positions on Perp/Future symbols, conservation invariant preserved across trades. M4.2 (close/reduce + mark price + liquidation) is next. See "Milestones" below.
 
 ## Architecture
 
@@ -94,8 +94,10 @@ cargo fmt --all
 | M2 | Spot matching: order book, R1/R2, synchronous pipeline + conservation property test | ✅ done |
 | M3.1 | WAL (bincode framed) + snapshot store + crash recovery tests | ✅ done |
 | M3.2 | Lock-free ring buffer + `AsyncMatchingEngine` (producer/consumer + backpressure) | ✅ done |
-| **M3.3** | CRC32 on WAL records + `submit_batch` group commit (batched fsync per ring batch) | ✅ done |
-| M4 | Derivatives: margin engine, perp/future contracts, liquidation queue, funding rate | next |
+| M3.3 | CRC32 on WAL records + `submit_batch` group commit (batched fsync per ring batch) | ✅ done |
+| **M4.1** | Derivative `Position` + isolated `margin_locked`, perp/future pre-check + settle for open/increase orders | ✅ done |
+| M4.2 | Close/reduce/flip orders, mark price command, unrealized PnL, liquidation trigger | next |
+| M4.3 | Perp funding rate + futures expiry settlement, conservation property test for derivatives | pending |
 | M5 | Productionization: tracing/Prometheus, fuzz suite, CI, stress tests, gray-release config, true 3-thread R1/Match/R2 via UID sharding | pending |
 
 Each milestone is independently shippable. Don't start M(n+1) work in M(n) — keep the boundary clean.

@@ -4,7 +4,7 @@ English | [中文](./README.md)
 
 Production-targeted matching engine for spot + perpetual/futures, written in Rust.
 
-> **Status: M3 (persistence + concurrency) complete.** WAL with CRC32 framing, snapshot store, lock-free ring buffer, group-commit batched fsync, crash recovery — all green. M4 (derivatives) is next. True 3-thread R1/Match/R2 parallelism awaits UID-sharded risk state in M5. See `CLAUDE.md` for milestones.
+> **Status: M4.1 (derivatives - positions + isolated margin) complete.** `Position` lives in `UserAccount`, `HoldKind::Derivative` routes margin-aware pre-check and settlement for perp/future symbols. Open and increase positions work; close/flip/mark-price/liquidation come in M4.2. See `CLAUDE.md` for milestones.
 
 ## Design goals
 
