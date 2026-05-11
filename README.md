@@ -1,47 +1,49 @@
 # matching-engine
 
-Production-targeted matching engine for spot + perpetual/futures, written in Rust.
+[English](./README_EN.md) | 中文
 
-> **Status: M1 (skeleton).** Most crates are stubs. See `CLAUDE.md` for milestones.
+面向生产的撮合引擎，覆盖现货 + 永续/期货，使用 Rust 编写。
 
-## Design goals
+> **当前状态：M1（骨架）。** 大部分 crate 仍是空壳，路线图详见 `CLAUDE.md`。
 
-- **Correctness first.** Every change is gated by a conservation-of-money property test: across any sequence of commands, the sum of user balances must equal net deposits in every currency. No input sequence can mint or destroy money.
-- **Determinism.** The pipeline is single-event-at-a-time per stage. Replay of the WAL reproduces engine state bit-for-bit.
-- **Performance, then portability.** Disruptor-style three-stage pipeline (R1 → Matching → R2) with one core per stage. i64 minor-units throughout; intermediate math widens to i128 to make overflow impossible at multiplications.
+## 设计目标
 
-## Layout
+- **正确性优先。** 每一次改动都由"资金守恒"属性测试守门：在任意命令序列下，每种货币的"用户余额之和"必须等于"净存款"。任何输入序列都不允许凭空增减资金。
+- **确定性。** 流水线每个阶段一次只处理一条事件，WAL 回放能 bit-for-bit 复现引擎状态。
+- **先性能，再可移植性。** Disruptor 风格的三段流水线（R1 → 撮合 → R2），每段独占一个核心。全程 i64 minor-unit；中间运算扩位到 i128，从乘法层面就消除溢出可能。
+
+## 仓库布局
 
 ```
 matching-engine/
 ├── crates/
-│   ├── me-types/        types, commands, events, conservation invariant
-│   ├── me-disruptor/    lock-free ring buffer (M3)
-│   ├── me-wal/          write-ahead log + snapshots (M3)
-│   ├── me-risk/         R1 pre-check + R2 settlement (M2)
-│   ├── me-matching/     order book + matching (M2)
-│   ├── me-core/         pipeline facade (M2/M3)
-│   └── me-server/       binary daemon (M5)
+│   ├── me-types/        类型、命令、事件、守恒不变量
+│   ├── me-disruptor/    无锁环形缓冲区（M3）
+│   ├── me-wal/          预写日志 + 快照（M3）
+│   ├── me-risk/         R1 前置风控 + R2 结算（M2）
+│   ├── me-matching/     订单簿 + 撮合（M2）
+│   ├── me-core/         流水线 facade（M2/M3）
+│   └── me-server/       binary daemon（M5）
 └── tests/
-    └── invariants/      cross-crate conservation tests
+    └── invariants/      跨 crate 的守恒不变量测试
 ```
 
-## Build / test
+## 构建 / 测试
 
 ```bash
 cargo build --workspace
-cargo test -p me-types        # M1 tests
+cargo test -p me-types        # M1 阶段的测试
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Requires Rust 1.75+.
+需要 Rust 1.75+。
 
-## What this is not
+## 这不是什么
 
-- Not a fork of the sibling `matching-core/` reference design. That code is for comparison; we don't depend on it.
-- Not a finished system. See `CLAUDE.md` milestones.
-- Not for unaudited production use. Conservation tests catch arithmetic bugs; they don't catch business-logic mistakes a real audit would.
+- **不是** 早期参考设计 `matching-core` 的 fork。后者仅作为对照，不被依赖。
+- **不是** 完成品。详见 `CLAUDE.md` 中的 milestone 划分。
+- **不能** 直接用于未经审计的生产环境。守恒测试能拦下算术 bug，拦不住业务逻辑层面的设计错误——那需要专门的审计流程。
 
-## License
+## 许可证
 
-MIT.
+MIT。
