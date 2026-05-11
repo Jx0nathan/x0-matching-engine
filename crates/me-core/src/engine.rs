@@ -1,66 +1,182 @@
+use std::path::Path;
+
 use ahash::AHashMap;
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use me_matching::{PlaceParams, SpotOrderBook};
 use me_risk::RiskEngine;
 use me_types::{
-    AdjustBalance, Command, CommandReceipt, CommandStatus, Event, OrderAccepted, OrderCancelled,
-    OrderFilled, OrderId, OrderPartiallyFilled, OrderRejected, PlaceOrder, RejectReason, SeqNo,
-    SymbolId, SymbolSpec, Timestamp, UserId,
+    AdjustBalance, Command, CommandEnvelope, CommandReceipt, CommandStatus, Event, OrderAccepted,
+    OrderCancelled, OrderFilled, OrderId, OrderPartiallyFilled, OrderRejected, PlaceOrder,
+    RejectReason, SeqNo, SymbolId, SymbolSpec, Timestamp, UserId,
 };
+use me_wal::{SnapshotStore, WalWriter};
 
-#[derive(Debug, Default)]
+/// Persistent state of the engine — everything that survives a restart.
+/// The `MatchingEngine` wraps this plus runtime handles (WAL writer,
+/// snapshot store) that are *not* serialized.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EngineSnapshot {
+    pub risk: RiskEngine,
+    pub books: AHashMap<SymbolId, SpotOrderBook>,
+    pub symbols: AHashMap<SymbolId, SymbolSpec>,
+    pub next_seq_no: u64,
+    pub next_order_id: u64,
+    pub last_applied_seq: SeqNo,
+}
+
+#[derive(Debug)]
 pub struct MatchingEngine {
-    risk: RiskEngine,
-    books: AHashMap<SymbolId, SpotOrderBook>,
-    symbols: AHashMap<SymbolId, SymbolSpec>,
-    next_seq_no: u64,
-    next_order_id: u64,
+    state: EngineSnapshot,
+    wal: Option<WalWriter>,
+    snapshot_store: Option<SnapshotStore>,
+}
+
+impl Default for MatchingEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MatchingEngine {
     pub fn new() -> Self {
         Self {
-            risk: RiskEngine::new(),
-            books: AHashMap::new(),
-            symbols: AHashMap::new(),
-            next_seq_no: 1,
-            next_order_id: 1,
+            state: EngineSnapshot {
+                risk: RiskEngine::new(),
+                books: AHashMap::new(),
+                symbols: AHashMap::new(),
+                next_seq_no: 1,
+                next_order_id: 1,
+                last_applied_seq: SeqNo(0),
+            },
+            wal: None,
+            snapshot_store: None,
         }
     }
 
-    pub fn register_symbol(&mut self, spec: SymbolSpec) -> Result<(), RejectReason> {
-        if self.symbols.contains_key(&spec.symbol_id) {
-            return Err(RejectReason::UnsupportedCommand);
+    /// Open an engine with persistence backing. On open: load the latest
+    /// snapshot (if any), then replay every WAL record with `seq > snapshot.seq`.
+    /// After this returns, the engine is at the exact state of `last_applied_seq`
+    /// in the WAL, and ready for new commands.
+    pub fn with_persistence<P: AsRef<Path>, Q: AsRef<Path>>(
+        wal_path: P,
+        snapshot_dir: Q,
+    ) -> Result<Self> {
+        let snapshot_store = SnapshotStore::open(snapshot_dir.as_ref())?;
+        let wal = WalWriter::open(wal_path.as_ref())?;
+
+        let mut eng = Self::new();
+        eng.snapshot_store = Some(snapshot_store);
+        eng.wal = Some(wal);
+        eng.restore(wal_path.as_ref())?;
+        Ok(eng)
+    }
+
+    fn restore(&mut self, wal_path: &Path) -> Result<()> {
+        // 1. Load the latest snapshot.
+        let mut last_snap_seq = SeqNo(0);
+        if let Some(store) = &self.snapshot_store {
+            if let Some((snap, seq)) = store.load_latest::<EngineSnapshot>()? {
+                self.state = snap;
+                last_snap_seq = seq;
+            }
         }
-        self.books.insert(spec.symbol_id, SpotOrderBook::new(spec.symbol_id));
-        self.symbols.insert(spec.symbol_id, spec);
+        // 2. Replay WAL records strictly after the snapshot.
+        let envs = me_wal::read_all(wal_path)?;
+        for env in envs {
+            if env.seq_no.0 > last_snap_seq.0 {
+                let _ = self.apply_envelope(&env);
+            }
+        }
         Ok(())
     }
 
+    /// Register a tradable symbol. This now routes through `submit` so the
+    /// addition is captured in the WAL and reconstructed on replay.
+    pub fn register_symbol(&mut self, spec: SymbolSpec) -> Result<(), RejectReason> {
+        let receipt = self.submit(Command::RegisterSymbol(spec), Timestamp(0));
+        match receipt.status {
+            CommandStatus::Accepted => Ok(()),
+            CommandStatus::Rejected(r) => Err(r),
+            _ => unreachable!("RegisterSymbol can only return Accepted or Rejected"),
+        }
+    }
+
+    fn handle_register_symbol(&mut self, seq_no: SeqNo, spec: SymbolSpec) -> CommandReceipt {
+        if self.state.symbols.contains_key(&spec.symbol_id) {
+            return CommandReceipt::rejected(seq_no, RejectReason::UnsupportedCommand);
+        }
+        self.state.books.insert(spec.symbol_id, SpotOrderBook::new(spec.symbol_id));
+        self.state.symbols.insert(spec.symbol_id, spec);
+        CommandReceipt {
+            seq_no,
+            status: CommandStatus::Accepted,
+            events: SmallVec::new(),
+        }
+    }
+
     pub fn risk(&self) -> &RiskEngine {
-        &self.risk
+        &self.state.risk
     }
 
     pub fn book(&self, symbol_id: SymbolId) -> Option<&SpotOrderBook> {
-        self.books.get(&symbol_id)
+        self.state.books.get(&symbol_id)
     }
 
     pub fn symbol(&self, symbol_id: SymbolId) -> Option<&SymbolSpec> {
-        self.symbols.get(&symbol_id)
+        self.state.symbols.get(&symbol_id)
+    }
+
+    pub fn last_applied_seq(&self) -> SeqNo {
+        self.state.last_applied_seq
+    }
+
+    /// Capture the current engine state into a snapshot. Persisted to the
+    /// snapshot store under `last_applied_seq`. Returns an error if the engine
+    /// has no snapshot store attached.
+    pub fn take_snapshot(&mut self) -> Result<SeqNo> {
+        let Some(store) = &self.snapshot_store else {
+            anyhow::bail!("engine has no snapshot store");
+        };
+        let seq = self.state.last_applied_seq;
+        store.save(&self.state, seq)?;
+        Ok(seq)
     }
 
     pub fn submit(&mut self, cmd: Command, now: Timestamp) -> CommandReceipt {
-        let seq_no = SeqNo(self.next_seq_no);
-        self.next_seq_no += 1;
+        let seq_no = SeqNo(self.state.next_seq_no);
+        self.state.next_seq_no += 1;
+        let env = CommandEnvelope { seq_no, received_at: now, command: cmd };
 
-        match cmd {
+        if let Some(wal) = &mut self.wal {
+            // Synchronous durability. M3.2 will batch sync via group commit.
+            wal.append(&env).expect("WAL append failed");
+            wal.sync().expect("WAL sync failed");
+        }
+
+        self.apply_envelope(&env)
+    }
+
+    /// Apply an envelope to engine state. Used both for live submissions
+    /// (after WAL append) and for replay during `restore` (no WAL append).
+    fn apply_envelope(&mut self, env: &CommandEnvelope) -> CommandReceipt {
+        let seq_no = env.seq_no;
+        let now = env.received_at;
+
+        // Keep next_seq_no monotonic even when replay skips ahead.
+        if seq_no.0 + 1 > self.state.next_seq_no {
+            self.state.next_seq_no = seq_no.0 + 1;
+        }
+
+        let receipt = match &env.command {
             Command::Nop => CommandReceipt {
                 seq_no,
                 status: CommandStatus::Accepted,
                 events: SmallVec::new(),
             },
-            Command::AddUser(add) => match self.risk.add_user(add.user_id) {
+            Command::AddUser(add) => match self.state.risk.add_user(add.user_id) {
                 Ok(()) => CommandReceipt {
                     seq_no,
                     status: CommandStatus::Accepted,
@@ -68,8 +184,8 @@ impl MatchingEngine {
                 },
                 Err(r) => CommandReceipt::rejected(seq_no, r),
             },
-            Command::AdjustBalance(adj) => self.handle_adjust_balance(seq_no, adj),
-            Command::SuspendUser(uid) => match self.risk.suspend(uid) {
+            Command::AdjustBalance(adj) => self.handle_adjust_balance(seq_no, adj.clone()),
+            Command::SuspendUser(uid) => match self.state.risk.suspend(*uid) {
                 Ok(()) => CommandReceipt {
                     seq_no,
                     status: CommandStatus::Accepted,
@@ -77,7 +193,7 @@ impl MatchingEngine {
                 },
                 Err(r) => CommandReceipt::rejected(seq_no, r),
             },
-            Command::ResumeUser(uid) => match self.risk.resume(uid) {
+            Command::ResumeUser(uid) => match self.state.risk.resume(*uid) {
                 Ok(()) => CommandReceipt {
                     seq_no,
                     status: CommandStatus::Accepted,
@@ -85,14 +201,22 @@ impl MatchingEngine {
                 },
                 Err(r) => CommandReceipt::rejected(seq_no, r),
             },
-            Command::PlaceOrder(p) => self.handle_place(seq_no, p, now),
-            Command::CancelOrder(c) => self.handle_cancel(seq_no, c.user_id, c.symbol_id, c.order_id, now),
-            Command::ModifyOrder(_) => CommandReceipt::rejected(seq_no, RejectReason::UnsupportedCommand),
-        }
+            Command::PlaceOrder(p) => self.handle_place(seq_no, p.clone(), now),
+            Command::CancelOrder(c) => {
+                self.handle_cancel(seq_no, c.user_id, c.symbol_id, c.order_id, now)
+            }
+            Command::RegisterSymbol(spec) => self.handle_register_symbol(seq_no, spec.clone()),
+            Command::ModifyOrder(_) => {
+                CommandReceipt::rejected(seq_no, RejectReason::UnsupportedCommand)
+            }
+        };
+
+        self.state.last_applied_seq = seq_no;
+        receipt
     }
 
     fn handle_adjust_balance(&mut self, seq_no: SeqNo, adj: AdjustBalance) -> CommandReceipt {
-        match self.risk.adjust_balance(&adj) {
+        match self.state.risk.adjust_balance(&adj) {
             Ok(()) => CommandReceipt {
                 seq_no,
                 status: CommandStatus::Accepted,
@@ -103,21 +227,20 @@ impl MatchingEngine {
     }
 
     fn handle_place(&mut self, seq_no: SeqNo, p: PlaceOrder, now: Timestamp) -> CommandReceipt {
-        let order_id = OrderId(self.next_order_id);
-        self.next_order_id += 1;
+        let order_id = OrderId(self.state.next_order_id);
+        self.state.next_order_id += 1;
 
-        let spec = match self.symbols.get(&p.symbol_id).cloned() {
+        let spec = match self.state.symbols.get(&p.symbol_id).cloned() {
             Some(s) => s,
             None => return Self::reject_place(seq_no, &p, now, RejectReason::UnknownSymbol),
         };
 
-        // R1 pre-check: register a Hold (if Ok). From here on, any path out
-        // of this function must drain that Hold.
-        if let Err(r) = self.risk.pre_check_place(&p, &spec, order_id) {
+        if let Err(r) = self.state.risk.pre_check_place(&p, &spec, order_id) {
             return Self::reject_place(seq_no, &p, now, r);
         }
 
         let book = self
+            .state
             .books
             .get_mut(&p.symbol_id)
             .expect("book exists since symbol registered");
@@ -134,30 +257,22 @@ impl MatchingEngine {
             timestamp: now,
         });
 
-        // Book-side reject (Fok unfillable, PostOnly would cross, etc.) →
-        // release the hold immediately. No fills happened.
         if let Some(reason) = outcome.reject {
-            // release_hold is idempotent and infallible for unknown ids.
-            let _ = self.risk.release_hold(order_id);
+            let _ = self.state.risk.release_hold(order_id);
             return Self::reject_place(seq_no, &p, now, reason);
         }
 
-        // Apply settlements for each trade.
         for trade in &outcome.trades {
-            // Failures here would indicate corrupted state — best to surface them.
-            // For M2 we panic-ish: in M3, propagate via a fault channel.
-            self.risk
+            self.state
+                .risk
                 .apply_trade(trade, &spec)
                 .expect("apply_trade should not fail in a consistent state");
         }
 
-        // If the order did not rest, any leftover hold needs releasing.
-        // (For Gtc/PostOnly that rested, the hold stays attached to order_id.)
         if !outcome.rested {
-            let _ = self.risk.release_hold(order_id);
+            let _ = self.state.risk.release_hold(order_id);
         }
 
-        // Build receipt events.
         let mut events: SmallVec<[Event; 4]> = SmallVec::new();
         events.push(Event::OrderAccepted(OrderAccepted {
             order_id,
@@ -189,20 +304,17 @@ impl MatchingEngine {
                 timestamp: now,
             }));
             CommandStatus::PartiallyFilled
+        } else if !outcome.rested {
+            events.push(Event::OrderCancelled(OrderCancelled {
+                order_id,
+                user_id: p.user_id,
+                symbol_id: p.symbol_id,
+                remaining_size: outcome.remaining,
+                timestamp: now,
+            }));
+            CommandStatus::Cancelled
         } else {
-            // No fills. Either rested or dropped immediately (IOC/Fok with no liquidity).
-            if !outcome.rested {
-                events.push(Event::OrderCancelled(OrderCancelled {
-                    order_id,
-                    user_id: p.user_id,
-                    symbol_id: p.symbol_id,
-                    remaining_size: outcome.remaining,
-                    timestamp: now,
-                }));
-                CommandStatus::Cancelled
-            } else {
-                CommandStatus::Accepted
-            }
+            CommandStatus::Accepted
         };
 
         CommandReceipt { seq_no, status, events }
@@ -216,7 +328,7 @@ impl MatchingEngine {
         order_id: OrderId,
         now: Timestamp,
     ) -> CommandReceipt {
-        let Some(book) = self.books.get_mut(&symbol_id) else {
+        let Some(book) = self.state.books.get_mut(&symbol_id) else {
             return CommandReceipt::rejected(seq_no, RejectReason::UnknownSymbol);
         };
         let outcome = match book.cancel(order_id) {
@@ -224,12 +336,9 @@ impl MatchingEngine {
             None => return CommandReceipt::rejected(seq_no, RejectReason::UnknownOrder),
         };
         if outcome.user_id != user_id {
-            // Authorization check: only the order owner may cancel.
-            // Re-insert would be cleanest, but for M2 the integration tests
-            // only cancel their own; treat this as a structural error.
             return CommandReceipt::rejected(seq_no, RejectReason::UnknownOrder);
         }
-        let _ = self.risk.release_hold(order_id);
+        let _ = self.state.risk.release_hold(order_id);
 
         let mut events: SmallVec<[Event; 4]> = SmallVec::new();
         events.push(Event::OrderCancelled(OrderCancelled {
@@ -369,7 +478,6 @@ mod tests {
         let usdt_before = eng.risk().total_internal(CurrencyId(2));
         let user_free_before = eng.risk().account(UserId(1)).unwrap().free(CurrencyId(2));
 
-        // FOK with no opposing liquidity → rejected at the book.
         let r = place(&mut eng, 1, 1, Side::Bid, 50_000_000, 100_000_000, TimeInForce::Fok);
         assert!(matches!(r.status, CommandStatus::Rejected(_)));
 
@@ -419,10 +527,8 @@ mod tests {
         let r = place(&mut eng, 2, 2, Side::Bid, 50_000_000, 100_000_000, TimeInForce::Ioc);
         assert!(matches!(r.status, CommandStatus::PartiallyFilled));
 
-        // No leaks: totals preserved.
         assert_eq!(eng.risk().total_internal(CurrencyId(1)), btc_before);
         assert_eq!(eng.risk().total_internal(CurrencyId(2)), usdt_before);
-        // Buyer has no residual hold.
         assert_eq!(eng.risk().account(UserId(2)).unwrap().held(CurrencyId(2)), Amount::ZERO);
     }
 
@@ -438,8 +544,18 @@ mod tests {
     fn insufficient_funds_rejects() {
         let mut eng = build_engine();
         add_user(&mut eng, 1);
-        // No deposit.
         let r = place(&mut eng, 1, 1, Side::Bid, 50_000_000, 100_000_000, TimeInForce::Gtc);
         assert!(matches!(r.status, CommandStatus::Rejected(RejectReason::InsufficientFunds)));
+    }
+
+    #[test]
+    fn last_applied_seq_advances() {
+        let mut eng = MatchingEngine::new();
+        assert_eq!(eng.last_applied_seq(), SeqNo(0));
+        add_user(&mut eng, 1);
+        let last = eng.last_applied_seq();
+        assert_eq!(last, SeqNo(1));
+        eng.submit(Command::Nop, Timestamp(0));
+        assert_eq!(eng.last_applied_seq(), SeqNo(2));
     }
 }

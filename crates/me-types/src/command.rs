@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use crate::{enums::*, ids::*, numeric::*};
+use crate::{enums::*, ids::*, numeric::*, symbol::SymbolSpec};
 
 /// All user-originated input to the engine. Distinct from Event (output) and
 /// CommandReceipt (final outcome). Each variant carries only the fields it
@@ -13,6 +13,9 @@ pub enum Command {
     AdjustBalance(AdjustBalance),
     SuspendUser(UserId),
     ResumeUser(UserId),
+    /// Register a new tradable symbol. Routed through the WAL so a restored
+    /// engine reconstructs its symbol set without out-of-band config replay.
+    RegisterSymbol(SymbolSpec),
     Nop,
 }
 

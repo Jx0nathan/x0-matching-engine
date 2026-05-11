@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A production-targeted matching engine for spot + perpetual/futures, built as a Cargo workspace. This is a **greenfield rewrite** of an earlier `matching-core` reference design; that legacy code is for comparison only and not depended on.
 
-Status: **M2 (spot matching) complete**. Spot engine + risk + end-to-end conservation property test all green. M3 (Disruptor + WAL) next. See "Milestones" below for what's implemented vs. planned.
+Status: **M3.1 (persistence) complete**. WAL with bincode framing + snapshot store + crash recovery integration tests all green. M3.2 (Disruptor 3-stage pipeline) is next. See "Milestones" below for what's implemented vs. planned.
 
 ## Architecture
 
@@ -41,9 +41,9 @@ Three handlers run on three threads, linked by `SequenceBarrier`. This is the "�
 | `me-types` | Numeric types, IDs, Command/Event/Receipt, SymbolSpec, conservation trait | ✅ M1 |
 | `me-matching` | Order book + matching (Limit; Gtc/Ioc/Fok/PostOnly) | ✅ M2 |
 | `me-risk` | Risk engine with paired hold/settle (`UserAccount`, `Hold`, `RiskEngine`) | ✅ M2 |
-| `me-core` | Synchronous facade `submit(Command) → CommandReceipt` | ✅ M2 |
-| `me-disruptor` | Lock-free ring buffer + SequenceBarrier | M3 (stub) |
-| `me-wal` | Write-ahead log + snapshot store | M3 (stub) |
+| `me-core` | Synchronous facade `submit(Command) → CommandReceipt` + persistence wiring | ✅ M2 + M3.1 |
+| `me-disruptor` | Lock-free ring buffer + SequenceBarrier | M3.2 (stub) |
+| `me-wal` | Write-ahead log + snapshot store | ✅ M3.1 |
 | `me-server` | Binary daemon | M5 (stub) |
 
 Conservation property test lives in `crates/me-core/tests/conservation.rs` and is the M2 quality gate.
@@ -91,8 +91,10 @@ cargo fmt --all
 | ID | Scope | Status |
 |---|---|---|
 | M1 | Workspace skeleton + `me-types` + conservation framework | ✅ done |
-| **M2** | Spot matching: order book, R1/R2, synchronous pipeline + conservation property test | ✅ done |
-| M3 | Persistence + concurrency: WAL group commit, snapshots, 3-handler Disruptor, crash recovery | next |
+| M2 | Spot matching: order book, R1/R2, synchronous pipeline + conservation property test | ✅ done |
+| **M3.1** | WAL (bincode framed) + snapshot store + crash recovery tests | ✅ done |
+| M3.2 | Three-handler Disruptor pipeline (R1 → Match → R2), real parallelism | next |
+| M3.3 | WAL group commit + CRC checksums + crash-via-kill test | pending |
 | M4 | Derivatives: margin engine, perp/future contracts, liquidation queue, funding rate | pending |
 | M5 | Productionization: tracing/Prometheus, fuzz suite, CI, stress tests, gray-release config | pending |
 

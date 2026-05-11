@@ -228,7 +228,9 @@ dependencies = [
  "me-types",
  "me-wal",
  "proptest",
+ "serde",
  "smallvec",
+ "tempfile",
  "tracing",
 ]
 
@@ -289,6 +291,8 @@ dependencies = [
  "bincode",
  "me-types",
  "serde",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

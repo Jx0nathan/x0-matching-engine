@@ -4,7 +4,7 @@ English | [中文](./README.md)
 
 Production-targeted matching engine for spot + perpetual/futures, written in Rust.
 
-> **Status: M2 (spot matching working).** Engine + risk + conservation property test in place. M3 adds concurrency and persistence. See `CLAUDE.md` for milestones.
+> **Status: M3.1 (persistence working).** WAL + snapshot + crash recovery tests all green; the synchronous `submit` path is durable. M3.2 adds the Disruptor 3-stage pipeline. See `CLAUDE.md` for milestones.
 
 ## Design goals
 
