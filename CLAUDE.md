@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A production-targeted matching engine for spot + perpetual/futures, built as a Cargo workspace. This is a **greenfield rewrite** of an earlier `matching-core` reference design; that legacy code is for comparison only and not depended on.
 
-Status: **M3.1 (persistence) complete**. WAL with bincode framing + snapshot store + crash recovery integration tests all green. M3.2 (Disruptor 3-stage pipeline) is next. See "Milestones" below for what's implemented vs. planned.
+Status: **M3.2 (async pipeline) complete**. Producer/consumer ring buffer with backpressure + `AsyncMatchingEngine` wrapping the sync engine in a consumer thread. M3.3 (group commit + CRC) is next. See "Milestones" below for what's implemented vs. planned.
 
 ## Architecture
 
@@ -32,7 +32,7 @@ client ─► CommandEnvelope ─► Disruptor RingBuffer
                               WAL fsync + result consumer
 ```
 
-Three handlers run on three threads, linked by `SequenceBarrier`. This is the "真 Disruptor 三段并行" decision — see `crates/me-disruptor` (M3).
+**M3.2 reality check**: the diagram above is the M5 endgame. Today we have a single consumer thread that runs R1+Match+R2 sequentially, fronted by the ring buffer. True 3-thread R1/Match/R2 parallelism requires UID-sharded `RiskEngine` so the handlers can write concurrently without conflict — that work is M5. The ring buffer primitives in `me-disruptor` are already multi-consumer ready.
 
 ### Crate layout
 
@@ -41,8 +41,8 @@ Three handlers run on three threads, linked by `SequenceBarrier`. This is the "�
 | `me-types` | Numeric types, IDs, Command/Event/Receipt, SymbolSpec, conservation trait | ✅ M1 |
 | `me-matching` | Order book + matching (Limit; Gtc/Ioc/Fok/PostOnly) | ✅ M2 |
 | `me-risk` | Risk engine with paired hold/settle (`UserAccount`, `Hold`, `RiskEngine`) | ✅ M2 |
-| `me-core` | Synchronous facade `submit(Command) → CommandReceipt` + persistence wiring | ✅ M2 + M3.1 |
-| `me-disruptor` | Lock-free ring buffer + SequenceBarrier | M3.2 (stub) |
+| `me-core` | Synchronous `MatchingEngine` + `AsyncMatchingEngine` (producer/consumer) + persistence | ✅ M2 + M3.1 + M3.2 |
+| `me-disruptor` | Single-producer ring buffer + Sequence + WaitStrategy | ✅ M3.2 |
 | `me-wal` | Write-ahead log + snapshot store | ✅ M3.1 |
 | `me-server` | Binary daemon | M5 (stub) |
 
@@ -92,9 +92,9 @@ cargo fmt --all
 |---|---|---|
 | M1 | Workspace skeleton + `me-types` + conservation framework | ✅ done |
 | M2 | Spot matching: order book, R1/R2, synchronous pipeline + conservation property test | ✅ done |
-| **M3.1** | WAL (bincode framed) + snapshot store + crash recovery tests | ✅ done |
-| M3.2 | Three-handler Disruptor pipeline (R1 → Match → R2), real parallelism | next |
-| M3.3 | WAL group commit + CRC checksums + crash-via-kill test | pending |
+| M3.1 | WAL (bincode framed) + snapshot store + crash recovery tests | ✅ done |
+| **M3.2** | Lock-free ring buffer + `AsyncMatchingEngine` (producer/consumer + backpressure) | ✅ done |
+| M3.3 | WAL group commit + CRC checksums + crash-via-kill test | next |
 | M4 | Derivatives: margin engine, perp/future contracts, liquidation queue, funding rate | pending |
 | M5 | Productionization: tracing/Prometheus, fuzz suite, CI, stress tests, gray-release config | pending |
 

@@ -4,7 +4,7 @@ English | [中文](./README.md)
 
 Production-targeted matching engine for spot + perpetual/futures, written in Rust.
 
-> **Status: M3.1 (persistence working).** WAL + snapshot + crash recovery tests all green; the synchronous `submit` path is durable. M3.2 adds the Disruptor 3-stage pipeline. See `CLAUDE.md` for milestones.
+> **Status: M3.2 (async pipeline working).** Lock-free ring buffer + `AsyncMatchingEngine` (producer/consumer split). WAL + snapshot + crash recovery all green. True 3-thread R1/Match/R2 parallelism awaits UID-sharded risk state in M5. See `CLAUDE.md` for milestones.
 
 ## Design goals
 
