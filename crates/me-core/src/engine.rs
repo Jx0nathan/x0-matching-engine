@@ -20,9 +20,10 @@ use me_matching::{PlaceParams, SpotOrderBook};
 use me_risk::RiskEngine;
 use me_types::{
     AdjustBalance, ApplyFunding, Command, CommandEnvelope, CommandReceipt, CommandStatus,
-    CurrencyId, Event, OrderAccepted, OrderCancelled, OrderFilled, OrderId, OrderPartiallyFilled,
-    OrderRejected, OrderType, PlaceOrder, Price, RejectReason, SeqNo, SetMarkPrice, SettleFuture,
-    Side, SymbolId, SymbolKindParams, SymbolSpec, TimeInForce, Timestamp, UserId,
+    CurrencyId, Event, ModifyOrder, OrderAccepted, OrderCancelled, OrderFilled, OrderId,
+    OrderPartiallyFilled, OrderRejected, OrderType, PlaceOrder, Price, RejectReason, SeqNo,
+    SelfTradePrevention, SetMarkPrice, SettleFuture, Side, Size, SymbolId, SymbolKindParams,
+    SymbolSpec, TimeInForce, Timestamp, UserId,
 };
 use me_wal::{SnapshotStore, WalWriter};
 
@@ -403,9 +404,7 @@ impl MatchingEngine {
             Command::SetMarkPrice(m) => self.handle_set_mark_price(seq_no, m.clone(), now),
             Command::ApplyFunding(f) => self.handle_apply_funding(seq_no, f.clone()),
             Command::SettleFuture(s) => self.handle_settle_future(seq_no, s.clone()),
-            Command::ModifyOrder(_) => {
-                CommandReceipt::rejected(seq_no, RejectReason::UnsupportedCommand)
-            }
+            Command::ModifyOrder(m) => self.handle_modify(seq_no, m.clone(), now),
         };
 
         self.state.last_applied_seq = seq_no;
@@ -638,6 +637,123 @@ impl MatchingEngine {
         };
 
         (status, events)
+    }
+
+    /// ModifyOrder implements cancel-and-replace. The existing resting order
+    /// is read for its side, price, client_order_id, and any iceberg metadata;
+    /// `new_price` and `new_size` override the relevant fields (each defaults
+    /// to the current value if None). The old order is removed from the book
+    /// and its hold released; a fresh `order_id` is allocated and the
+    /// synthetic replacement runs the normal pre_check + apply_to_book path.
+    /// Time priority is lost — that's the trade-off for not building a
+    /// preserving-amend code path (which only works in narrow cases).
+    fn handle_modify(
+        &mut self,
+        seq_no: SeqNo,
+        cmd: ModifyOrder,
+        now: Timestamp,
+    ) -> CommandReceipt {
+        // Snapshot the existing order (cloned so we can drop the borrow before
+        // mutating the book on the cancel/replace below).
+        let existing = {
+            let Some(book) = self.state.books.get(&cmd.symbol_id) else {
+                return CommandReceipt::rejected(seq_no, RejectReason::UnknownSymbol);
+            };
+            match book.get_order(cmd.order_id) {
+                Some(o) => o.clone(),
+                None => return CommandReceipt::rejected(seq_no, RejectReason::UnknownOrder),
+            }
+        };
+        if existing.user_id != cmd.user_id {
+            return CommandReceipt::rejected(seq_no, RejectReason::UnknownOrder);
+        }
+
+        let new_price = cmd.new_price.unwrap_or(existing.price);
+        // For iceberg orders the "remaining order" is visible + hidden.
+        let current_total =
+            existing.size_remaining.raw() + existing.hidden_remaining.raw();
+        let new_size = cmd.new_size.unwrap_or(Size(current_total));
+        if !new_size.is_positive() {
+            return CommandReceipt::rejected(seq_no, RejectReason::SizeBelowMinimum);
+        }
+
+        let is_iceberg = existing.visible_slice.raw() > 0;
+        let order_type = if is_iceberg { OrderType::Iceberg } else { OrderType::Limit };
+        let visible_size = if is_iceberg { Some(existing.visible_slice) } else { None };
+
+        let new_place = PlaceOrder {
+            user_id: cmd.user_id,
+            symbol_id: cmd.symbol_id,
+            client_order_id: existing.client_order_id,
+            side: existing.side,
+            order_type,
+            time_in_force: TimeInForce::Gtc,
+            price: Some(new_price),
+            size: new_size,
+            reserve_price: None,
+            stop_price: None,
+            visible_size,
+            self_trade_prevention: SelfTradePrevention::None,
+        };
+
+        let new_order_id = OrderId(self.state.next_order_id);
+        self.state.next_order_id += 1;
+
+        let Some(spec) = self.state.symbols.get(&cmd.symbol_id).cloned() else {
+            return CommandReceipt::rejected(seq_no, RejectReason::UnknownSymbol);
+        };
+
+        // Cancel the old order: remove from book and release its risk hold.
+        let cancel_outcome = {
+            let book = self
+                .state
+                .books
+                .get_mut(&cmd.symbol_id)
+                .expect("symbol registered");
+            book.cancel(cmd.order_id).expect("just verified by get_order")
+        };
+        let _ = self.state.risk.release_hold(cmd.order_id);
+
+        // Pre-check the replacement. If pre-check rejects (e.g. user can't
+        // cover the increased size), the old order is already cancelled and
+        // its hold returned to free — the user is now flat on this order_id.
+        if let Err(r) = self.state.risk.pre_check_place(&new_place, &spec, new_order_id) {
+            let mut events: SmallVec<[Event; 4]> = SmallVec::new();
+            events.push(Event::OrderCancelled(OrderCancelled {
+                order_id: cmd.order_id,
+                user_id: cmd.user_id,
+                symbol_id: cmd.symbol_id,
+                remaining_size: cancel_outcome.remaining_size,
+                timestamp: now,
+            }));
+            events.push(Event::OrderRejected(OrderRejected {
+                client_order_id: new_place.client_order_id,
+                user_id: new_place.user_id,
+                symbol_id: new_place.symbol_id,
+                reason: r,
+                timestamp: now,
+            }));
+            return CommandReceipt {
+                seq_no,
+                status: CommandStatus::Rejected(r),
+                events,
+            };
+        }
+
+        let (status, mut new_events) = self.apply_to_book(new_order_id, &new_place, &spec, now);
+
+        let mut events: SmallVec<[Event; 4]> = SmallVec::new();
+        events.push(Event::OrderCancelled(OrderCancelled {
+            order_id: cmd.order_id,
+            user_id: cmd.user_id,
+            symbol_id: cmd.symbol_id,
+            remaining_size: cancel_outcome.remaining_size,
+            timestamp: now,
+        }));
+        for ev in new_events.drain(..) {
+            events.push(ev);
+        }
+        CommandReceipt { seq_no, status, events }
     }
 
     fn handle_cancel(
@@ -1153,6 +1269,138 @@ mod tests {
         // Mark moves but doesn't reach 55e6.
         set_mark(&mut eng, 54_999_999);
         assert!(eng.book(SymbolId(1)).unwrap().best_ask().is_some());
+    }
+
+    // ---- ModifyOrder (M5.3) ----
+
+    fn modify_order(
+        eng: &mut MatchingEngine,
+        uid: u64,
+        order_id: u64,
+        new_price: Option<i64>,
+        new_size: Option<i64>,
+    ) -> CommandReceipt {
+        eng.submit(
+            Command::ModifyOrder(me_types::ModifyOrder {
+                user_id: UserId(uid),
+                symbol_id: SymbolId(1),
+                order_id: OrderId(order_id),
+                new_price: new_price.map(Price),
+                new_size: new_size.map(Size),
+            }),
+            Timestamp(0),
+        )
+    }
+
+    fn place_get_order_id(
+        eng: &mut MatchingEngine,
+        uid: u64,
+        coid: u64,
+        side: Side,
+        price: i64,
+        size: i64,
+    ) -> OrderId {
+        let r = place(eng, uid, coid, side, price, size, TimeInForce::Gtc);
+        match r.events.iter().find(|e| matches!(e, Event::OrderAccepted(_))) {
+            Some(Event::OrderAccepted(a)) => a.order_id,
+            _ => panic!("expected OrderAccepted"),
+        }
+    }
+
+    #[test]
+    fn modify_changes_price_loses_priority() {
+        let mut eng = build_engine();
+        add_user(&mut eng, 1);
+        deposit(&mut eng, 1, 2, 10_000_000_000);
+
+        let oid = place_get_order_id(&mut eng, 1, 1, Side::Bid, 50_000_000, 10_000_000);
+
+        let r = modify_order(&mut eng, 1, oid.0, Some(48_000_000), None);
+        // Old order cancelled, new order placed at new price.
+        let cancelled = r.events.iter().any(|e| matches!(e, Event::OrderCancelled(c) if c.order_id == oid));
+        let accepted_new = r.events.iter().any(|e| matches!(e, Event::OrderAccepted(a) if a.order_id != oid));
+        assert!(cancelled, "old order should be cancelled");
+        assert!(accepted_new, "new order should be accepted");
+        assert_eq!(eng.book(SymbolId(1)).unwrap().best_bid(), Some(Price(48_000_000)));
+    }
+
+    #[test]
+    fn modify_reduces_size() {
+        let mut eng = build_engine();
+        add_user(&mut eng, 1);
+        deposit(&mut eng, 1, 2, 10_000_000_000);
+
+        let oid = place_get_order_id(&mut eng, 1, 1, Side::Bid, 50_000_000, 10_000_000);
+        let r = modify_order(&mut eng, 1, oid.0, None, Some(4_000_000));
+        assert!(matches!(r.status, CommandStatus::Accepted));
+        // New order's size is 4M, at original price.
+        let new_oid = match r.events.iter().find(|e| matches!(e, Event::OrderAccepted(a) if a.order_id != oid)) {
+            Some(Event::OrderAccepted(a)) => a.order_id,
+            _ => panic!("no new accepted"),
+        };
+        let new_order = eng.book(SymbolId(1)).unwrap().get_order(new_oid).unwrap();
+        assert_eq!(new_order.size_remaining, Size(4_000_000));
+        assert_eq!(new_order.price, Price(50_000_000));
+    }
+
+    #[test]
+    fn modify_increases_size_with_sufficient_funds() {
+        let mut eng = build_engine();
+        add_user(&mut eng, 1);
+        deposit(&mut eng, 1, 2, 10_000_000_000);
+
+        let oid = place_get_order_id(&mut eng, 1, 1, Side::Bid, 50_000_000, 5_000_000);
+        let r = modify_order(&mut eng, 1, oid.0, None, Some(20_000_000));
+        assert!(matches!(r.status, CommandStatus::Accepted));
+        let new_oid = match r.events.iter().find(|e| matches!(e, Event::OrderAccepted(a) if a.order_id != oid)) {
+            Some(Event::OrderAccepted(a)) => a.order_id,
+            _ => panic!("no new accepted"),
+        };
+        let new_order = eng.book(SymbolId(1)).unwrap().get_order(new_oid).unwrap();
+        assert_eq!(new_order.size_remaining, Size(20_000_000));
+    }
+
+    #[test]
+    fn modify_unknown_order_rejects() {
+        let mut eng = build_engine();
+        add_user(&mut eng, 1);
+        deposit(&mut eng, 1, 2, 10_000_000_000);
+
+        let r = modify_order(&mut eng, 1, 999, Some(48_000_000), None);
+        assert!(matches!(r.status, CommandStatus::Rejected(RejectReason::UnknownOrder)));
+    }
+
+    #[test]
+    fn modify_by_non_owner_rejects() {
+        let mut eng = build_engine();
+        add_user(&mut eng, 1);
+        add_user(&mut eng, 2);
+        deposit(&mut eng, 1, 2, 10_000_000_000);
+
+        let oid = place_get_order_id(&mut eng, 1, 1, Side::Bid, 50_000_000, 10_000_000);
+        // User 2 tries to modify user 1's order.
+        let r = modify_order(&mut eng, 2, oid.0, Some(48_000_000), None);
+        assert!(matches!(r.status, CommandStatus::Rejected(RejectReason::UnknownOrder)));
+        // Original order still on the book.
+        assert_eq!(eng.book(SymbolId(1)).unwrap().best_bid(), Some(Price(50_000_000)));
+    }
+
+    #[test]
+    fn modify_returns_full_hold_when_replacement_fails_pre_check() {
+        let mut eng = build_engine();
+        add_user(&mut eng, 1);
+        // Deposit just enough for the initial order plus tiny buffer.
+        deposit(&mut eng, 1, 2, 600_000_000);
+
+        // 10M at 50e6 = notional 5_000_000, + 0.2% fee = 10_000 → hold ~5_010_000.
+        let oid = place_get_order_id(&mut eng, 1, 1, Side::Bid, 50_000_000, 10_000_000);
+        // Try to grow to 200M (notional 100_000_000) — too expensive.
+        let r = modify_order(&mut eng, 1, oid.0, None, Some(2_000_000_000));
+        assert!(matches!(r.status, CommandStatus::Rejected(RejectReason::InsufficientFunds)));
+        // Old order is gone (cancelled atomically), held funds returned.
+        assert!(eng.book(SymbolId(1)).unwrap().get_order(oid).is_none());
+        let user1 = eng.risk().account(UserId(1)).unwrap();
+        assert_eq!(user1.held(CurrencyId(2)).raw(), 0);
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 面向生产的撮合引擎，覆盖现货 + 永续/期货，使用 Rust 编写。
 
-> **当前状态：M5.2（订单类型完整）完成。** Market（一键最坏价格 IOC）、Iceberg（可见 + 隐藏切片，切片消耗后重排到队尾失去时间优先）、Stop（StopLimit / StopMarket，挂在 pending_stops，SetMarkPrice 跨过 stop_price 时触发）全部接入。M5.1 的自成交保护、M4 的衍生品、M3 的持久化与并发一并保留。路线图详见 `CLAUDE.md`。
+> **当前状态：M5.3（ModifyOrder）完成。** 改单走 cancel-and-replace：读出原挂单的 side/price/size_remaining/visible_slice，用 new_price / new_size 覆盖建新 PlaceOrder，旧单 cancel + 风控 release_hold，新单走完整的 pre_check + apply_to_book 路径，分配新 order_id（失去时间优先）。M5.2 订单类型、M5.1 自成交保护、M4 衍生品、M3 持久化与并发一并保留。路线图详见 `CLAUDE.md`。
 
 ## 设计目标
 
