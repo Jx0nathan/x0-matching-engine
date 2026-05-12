@@ -100,7 +100,8 @@ cargo fmt --all
 | M4.3 | Flip-in-one-order, `Command::SetMarkPrice` + liquidation, `Command::ApplyFunding`, `Command::SettleFuture`, derivative property test, tracing on hot paths | ✅ done |
 | M5.1 | Self-trade prevention: CancelTaker / CancelMaker / CancelBoth / DecrementAndCancel; partial hold release for DAC partial-reduce | ✅ done |
 | M5.2 | Market orders (lower to Limit-at-reserve + IOC) + Iceberg orders (visible/hidden slices, refresh + relink-to-tail) + Stop orders (pending until mark crosses, then triggered into a Limit) | ✅ done |
-| **M5.3** | ModifyOrder via cancel-and-replace: read existing resting order, build synthetic PlaceOrder with new_price/new_size overrides, atomic cancel-old + pre_check + apply_to_book new under fresh order_id | ✅ done |
+| M5.3 | ModifyOrder via cancel-and-replace: read existing resting order, build synthetic PlaceOrder with new_price/new_size overrides, atomic cancel-old + pre_check + apply_to_book new under fresh order_id | ✅ done |
+| **M5.4** | Insurance fund (`INSURANCE_FUND = UserId(u64::MAX)`). Bankruptcy on liquidation routed to insurance so user balances never go negative. Funding-rate imbalance from asymmetric OI also credits/debits insurance | ✅ done |
 | M5 | Productionization: tracing/Prometheus, fuzz suite, CI, stress tests, gray-release config, true 3-thread R1/Match/R2 via UID sharding | pending |
 
 Each milestone is independently shippable. Don't start M(n+1) work in M(n) — keep the boundary clean.

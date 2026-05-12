@@ -4,7 +4,7 @@ English | [中文](./README.md)
 
 Production-targeted matching engine for spot + perpetual/futures, written in Rust.
 
-> **Status: M5.3 (ModifyOrder) complete.** Modify is implemented as cancel-and-replace: snapshot the existing resting order (side / price / size_remaining / visible_slice), build a synthetic PlaceOrder with `new_price` / `new_size` overrides, atomically remove the old + release hold, then pre_check and apply_to_book the replacement under a fresh order_id (time priority is lost). M5.2 order types, M5.1 STP, M4 derivatives, M3 persistence all preserved. See `CLAUDE.md`.
+> **Status: M5.4 (insurance fund) complete.** New `INSURANCE_FUND = UserId(u64::MAX)` system account. Liquidation losses exceeding the user's margin (which would drive balance negative) are absorbed by the insurance fund — user balance is zeroed, deficit debited from insurance. Funding-rate settlement also routes the OI-imbalance residual through insurance. Insurance fund itself may go negative under extreme drawdowns (ADL / socialised losses left for M5+). M5.3 modify, M5.2 order types, M5.1 STP, M4 derivatives, M3 persistence all preserved. See `CLAUDE.md`.
 
 ## Design goals
 

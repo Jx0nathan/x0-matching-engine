@@ -4,7 +4,7 @@
 
 面向生产的撮合引擎，覆盖现货 + 永续/期货，使用 Rust 编写。
 
-> **当前状态：M5.3（ModifyOrder）完成。** 改单走 cancel-and-replace：读出原挂单的 side/price/size_remaining/visible_slice，用 new_price / new_size 覆盖建新 PlaceOrder，旧单 cancel + 风控 release_hold，新单走完整的 pre_check + apply_to_book 路径，分配新 order_id（失去时间优先）。M5.2 订单类型、M5.1 自成交保护、M4 衍生品、M3 持久化与并发一并保留。路线图详见 `CLAUDE.md`。
+> **当前状态：M5.4（保险基金）完成。** 新增 `INSURANCE_FUND = UserId(u64::MAX)` 系统账户。强平超出保证金的亏损（用户余额会变负）由保险基金吸收，用户余额归零；衍生品 OI 不对称时资金费率结算的净额也走保险基金（多头多付/少付的差额）。极端行情下保险基金本身可以变负（ADL/社会化损失留给 M5+）。M5.3 改单、M5.2 订单类型、M5.1 STP、M4 衍生品、M3 持久化全部保留。路线图详见 `CLAUDE.md`。
 
 ## 设计目标
 
