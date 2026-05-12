@@ -11,8 +11,8 @@ use me_risk::RiskEngine;
 use me_types::{
     AdjustBalance, ApplyFunding, Command, CommandEnvelope, CommandReceipt, CommandStatus,
     CurrencyId, Event, OrderAccepted, OrderCancelled, OrderFilled, OrderId, OrderPartiallyFilled,
-    OrderRejected, PlaceOrder, Price, RejectReason, SeqNo, SetMarkPrice, SettleFuture, SymbolId,
-    SymbolKindParams, SymbolSpec, Timestamp, UserId,
+    OrderRejected, OrderType, PlaceOrder, Price, RejectReason, SeqNo, SetMarkPrice, SettleFuture,
+    Side, SymbolId, SymbolKindParams, SymbolSpec, TimeInForce, Timestamp, UserId,
 };
 use me_wal::{SnapshotStore, WalWriter};
 
@@ -357,6 +357,35 @@ impl MatchingEngine {
             None => return Self::reject_place(seq_no, &p, now, RejectReason::UnknownSymbol),
         };
 
+        // Lower Market to a Limit-at-reserve with forced IOC. A Market Bid
+        // needs *some* upper bound for the risk hold; we use the caller's
+        // reserve_price (or price if reserve is omitted). A Market Ask
+        // accepts any positive bid, so we drop the floor to 0.
+        let mut p = p;
+        if matches!(p.order_type, OrderType::Market) {
+            match p.side {
+                Side::Bid => {
+                    let bound = p.reserve_price.or(p.price);
+                    match bound {
+                        Some(price) => {
+                            p.price = Some(price);
+                            p.reserve_price = Some(price);
+                            p.order_type = OrderType::Limit;
+                            p.time_in_force = TimeInForce::Ioc;
+                        }
+                        None => {
+                            return Self::reject_place(seq_no, &p, now, RejectReason::MissingPrice);
+                        }
+                    }
+                }
+                Side::Ask => {
+                    p.price = Some(Price(0));
+                    p.order_type = OrderType::Limit;
+                    p.time_in_force = TimeInForce::Ioc;
+                }
+            }
+        }
+
         if let Err(r) = self.state.risk.pre_check_place(&p, &spec, order_id) {
             return Self::reject_place(seq_no, &p, now, r);
         }
@@ -378,6 +407,7 @@ impl MatchingEngine {
             size: p.size,
             timestamp: now,
             stp: p.self_trade_prevention,
+            visible_size: p.visible_size,
         });
 
         if let Some(reason) = outcome.reject {
@@ -792,6 +822,86 @@ mod tests {
             );
         }
         assert_eq!(one_by_one.last_applied_seq(), batched.last_applied_seq());
+    }
+
+    // ---- Market orders (M5.2.a) ----
+
+    fn place_market(
+        eng: &mut MatchingEngine,
+        uid: u64,
+        coid: u64,
+        side: Side,
+        reserve_price: Option<i64>,
+        size: i64,
+    ) -> CommandReceipt {
+        eng.submit(
+            Command::PlaceOrder(PlaceOrder {
+                user_id: UserId(uid),
+                symbol_id: SymbolId(1),
+                client_order_id: ClientOrderId(coid),
+                side,
+                order_type: OrderType::Market,
+                time_in_force: TimeInForce::Ioc,
+                price: None,
+                size: Size(size),
+                reserve_price: reserve_price.map(Price),
+                stop_price: None,
+                visible_size: None,
+                self_trade_prevention: SelfTradePrevention::None,
+            }),
+            Timestamp(0),
+        )
+    }
+
+    #[test]
+    fn market_bid_fills_available_liquidity_up_to_reserve() {
+        let mut eng = build_engine();
+        add_user(&mut eng, 1);
+        add_user(&mut eng, 2);
+        deposit(&mut eng, 1, 1, 100_000_000);
+        deposit(&mut eng, 2, 2, 10_000_000_000);
+
+        place(&mut eng, 1, 1, Side::Ask, 50_000_000, 100_000_000, TimeInForce::Gtc);
+        let r = place_market(&mut eng, 2, 2, Side::Bid, Some(60_000_000), 50_000_000);
+        // Filled at maker price 50e6, not at the 60e6 reserve.
+        assert_eq!(r.status, CommandStatus::Filled);
+    }
+
+    #[test]
+    fn market_ask_sells_at_any_bid_price() {
+        let mut eng = build_engine();
+        add_user(&mut eng, 1);
+        add_user(&mut eng, 2);
+        deposit(&mut eng, 1, 1, 100_000_000);
+        deposit(&mut eng, 2, 2, 10_000_000_000);
+
+        // Buyer has a bid at 30e6 (much lower than 50e6 mid).
+        place(&mut eng, 2, 1, Side::Bid, 30_000_000, 50_000_000, TimeInForce::Gtc);
+        // Seller market-asks 50M — should hit the 30e6 bid regardless of "fair" price.
+        let r = place_market(&mut eng, 1, 2, Side::Ask, None, 50_000_000);
+        assert_eq!(r.status, CommandStatus::Filled);
+    }
+
+    #[test]
+    fn market_bid_without_reserve_rejects() {
+        let mut eng = build_engine();
+        add_user(&mut eng, 1);
+        deposit(&mut eng, 1, 2, 10_000_000_000);
+
+        let r = place_market(&mut eng, 1, 1, Side::Bid, None, 50_000_000);
+        assert!(matches!(r.status, CommandStatus::Rejected(RejectReason::MissingPrice)));
+    }
+
+    #[test]
+    fn market_with_no_liquidity_cancels() {
+        let mut eng = build_engine();
+        add_user(&mut eng, 1);
+        deposit(&mut eng, 1, 2, 10_000_000_000);
+
+        // Empty ask side — Market Bid finds nothing.
+        let r = place_market(&mut eng, 1, 1, Side::Bid, Some(50_000_000), 50_000_000);
+        // No fill, IOC drops it → Cancelled.
+        assert!(matches!(r.status, CommandStatus::Cancelled));
     }
 
     #[test]

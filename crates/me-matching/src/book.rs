@@ -14,6 +14,12 @@ type BucketIdx = usize;
 
 /// A passive resting order on the book. Forms an intrusive doubly-linked list
 /// within its price bucket; `next`/`prev` are indices into the parent `Slab`.
+///
+/// Iceberg encoding: `size_remaining` is the *visible* portion currently on
+/// the book; `hidden_remaining` is the unrevealed quantity that will be
+/// sliced into new visible portions of size `visible_slice` as the visible
+/// part gets filled. For non-iceberg orders, `visible_slice == 0` and
+/// `hidden_remaining == 0`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestingOrder {
     pub order_id: OrderId,
@@ -23,6 +29,10 @@ pub struct RestingOrder {
     pub size_remaining: Size,
     pub side: Side,
     pub timestamp: Timestamp,
+    #[serde(default)]
+    pub visible_slice: Size,
+    #[serde(default)]
+    pub hidden_remaining: Size,
     next: Option<OrderIdx>,
     prev: Option<OrderIdx>,
     bucket: BucketIdx,
@@ -98,6 +108,9 @@ pub struct PlaceParams {
     pub size: Size,
     pub timestamp: Timestamp,
     pub stp: SelfTradePrevention,
+    /// For OrderType::Iceberg: the visible slice size. Must be Some(>0) and
+    /// `<= size`. For all other order types: must be None.
+    pub visible_size: Option<Size>,
 }
 
 impl SpotOrderBook {
@@ -117,7 +130,7 @@ impl SpotOrderBook {
     }
 
     pub fn place(&mut self, params: PlaceParams) -> PlacementOutcome {
-        if !matches!(params.order_type, OrderType::Limit) {
+        if !matches!(params.order_type, OrderType::Limit | OrderType::Iceberg) {
             return PlacementOutcome {
                 trades: SmallVec::new(),
                 filled: Size::ZERO,
@@ -126,6 +139,34 @@ impl SpotOrderBook {
                 reject: Some(RejectReason::UnsupportedCommand),
                 stp_cancellations: SmallVec::new(),
             };
+        }
+        if matches!(params.order_type, OrderType::Iceberg) {
+            // Iceberg must have a positive visible slice ≤ total size, and a
+            // TIF that allows resting (otherwise the slice mechanic is moot).
+            let visible = params.visible_size.unwrap_or(Size::ZERO);
+            if visible.raw() <= 0 || visible.raw() > params.size.raw() {
+                return PlacementOutcome {
+                    trades: SmallVec::new(),
+                    filled: Size::ZERO,
+                    remaining: params.size,
+                    rested: false,
+                    reject: Some(RejectReason::UnsupportedCommand),
+                    stp_cancellations: SmallVec::new(),
+                };
+            }
+            if !matches!(
+                params.time_in_force,
+                TimeInForce::Gtc | TimeInForce::Day | TimeInForce::Gtd(_)
+            ) {
+                return PlacementOutcome {
+                    trades: SmallVec::new(),
+                    filled: Size::ZERO,
+                    remaining: params.size,
+                    rested: false,
+                    reject: Some(RejectReason::UnsupportedCommand),
+                    stp_cancellations: SmallVec::new(),
+                };
+            }
         }
         if !params.size.is_positive() {
             return PlacementOutcome {
@@ -198,6 +239,11 @@ impl SpotOrderBook {
                 | TimeInForce::PostOnly
                 | TimeInForce::Day
                 | TimeInForce::Gtd(_) => {
+                    let visible = if matches!(params.order_type, OrderType::Iceberg) {
+                        params.visible_size.unwrap_or(remaining)
+                    } else {
+                        Size::ZERO // 0 marks "not iceberg"
+                    };
                     self.rest_order(
                         params.order_id,
                         params.user_id,
@@ -206,6 +252,7 @@ impl SpotOrderBook {
                         remaining,
                         params.side,
                         params.timestamp,
+                        visible,
                     );
                     true
                 }
@@ -483,6 +530,25 @@ impl SpotOrderBook {
                 remaining = Size(remaining.raw() - fill.raw());
 
                 if self.orders[head_idx].size_remaining.is_zero() {
+                    // Iceberg: if hidden quantity remains, refresh the next
+                    // slice and move this order to the FIFO tail (losing time
+                    // priority for the refreshed portion).
+                    if self.orders[head_idx].hidden_remaining.is_positive() {
+                        let slice_cap = self.orders[head_idx].visible_slice;
+                        let hidden = self.orders[head_idx].hidden_remaining;
+                        let next_slice =
+                            Size(slice_cap.raw().min(hidden.raw()));
+                        self.orders[head_idx].size_remaining = next_slice;
+                        self.orders[head_idx].hidden_remaining =
+                            Size(hidden.raw() - next_slice.raw());
+                        self.buckets[bucket_idx].total_volume = Size(
+                            self.buckets[bucket_idx].total_volume.raw() + next_slice.raw(),
+                        );
+                        self.relink_head_to_tail(head_idx, bucket_idx);
+                        // The taker may still have remaining; loop continues
+                        // with the new bucket head (which is whatever was next).
+                        continue;
+                    }
                     let head_order_id = self.orders[head_idx].order_id;
                     self.by_order_id.remove(&head_order_id);
                     let head_order = self.orders.remove(head_idx);
@@ -508,17 +574,31 @@ impl SpotOrderBook {
         size: Size,
         side: Side,
         timestamp: Timestamp,
+        visible_slice: Size,
     ) {
         let bucket_idx = self.get_or_create_bucket(side, price);
+
+        // Iceberg: show only the visible slice; remainder is hidden until the
+        // slice gets filled. Non-iceberg: visible_slice == 0 → show full size,
+        // no hidden quantity.
+        let (initial_visible, hidden) = if visible_slice.raw() > 0
+            && visible_slice.raw() < size.raw()
+        {
+            (visible_slice, Size(size.raw() - visible_slice.raw()))
+        } else {
+            (size, Size::ZERO)
+        };
 
         let order = RestingOrder {
             order_id,
             user_id,
             client_order_id,
             price,
-            size_remaining: size,
+            size_remaining: initial_visible,
             side,
             timestamp,
+            visible_slice,
+            hidden_remaining: hidden,
             next: None,
             prev: Some(self.buckets[bucket_idx].tail),
             bucket: bucket_idx,
@@ -534,8 +614,35 @@ impl SpotOrderBook {
         }
         self.buckets[bucket_idx].tail = order_idx;
         self.buckets[bucket_idx].total_volume =
-            Size(self.buckets[bucket_idx].total_volume.raw() + size.raw());
+            Size(self.buckets[bucket_idx].total_volume.raw() + initial_visible.raw());
         self.by_order_id.insert(order_id, order_idx);
+    }
+
+    /// Move `order_idx` (assumed to be the bucket's current head) to the
+    /// bucket's tail. Used to refresh an iceberg's next slice — the refreshed
+    /// portion goes to the back of the FIFO queue, losing time priority.
+    fn relink_head_to_tail(&mut self, order_idx: OrderIdx, bucket_idx: BucketIdx) {
+        // If only order in the bucket, nothing to do.
+        if self.buckets[bucket_idx].tail == order_idx
+            && self.buckets[bucket_idx].head == order_idx
+        {
+            return;
+        }
+        let next = self.orders[order_idx].next;
+        // Detach from head.
+        match next {
+            Some(next_idx) => {
+                self.orders[next_idx].prev = None;
+                self.buckets[bucket_idx].head = next_idx;
+            }
+            None => return, // sole order, no relink needed
+        }
+        // Attach at tail.
+        let old_tail = self.buckets[bucket_idx].tail;
+        self.orders[old_tail].next = Some(order_idx);
+        self.orders[order_idx].prev = Some(old_tail);
+        self.orders[order_idx].next = None;
+        self.buckets[bucket_idx].tail = order_idx;
     }
 
     fn get_or_create_bucket(&mut self, side: Side, price: Price) -> BucketIdx {
@@ -621,6 +728,25 @@ mod tests {
             size: Size(sz),
             timestamp: me_types::Timestamp(0),
             stp,
+            visible_size: None,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn place_iceberg(book: &mut SpotOrderBook, oid: u64, uid: u64, side: Side, px: i64, sz: i64,
+                     visible: i64) -> PlacementOutcome {
+        book.place(PlaceParams {
+            order_id: OrderId(oid),
+            user_id: UserId(uid),
+            client_order_id: ClientOrderId(oid),
+            side,
+            order_type: OrderType::Iceberg,
+            time_in_force: TimeInForce::Gtc,
+            price: Price(px),
+            size: Size(sz),
+            timestamp: me_types::Timestamp(0),
+            stp: SelfTradePrevention::None,
+            visible_size: Some(Size(visible)),
         })
     }
 
@@ -852,6 +978,97 @@ mod tests {
         assert_eq!(r.remaining, Size(0));
         // Book is empty.
         assert!(book.best_ask().is_none());
+    }
+
+    // ---- Iceberg orders (M5.2.b) ----
+
+    #[test]
+    fn iceberg_shows_only_visible_slice_on_book() {
+        let mut book = SpotOrderBook::new(SymbolId(1));
+        // 100 total, 20 visible.
+        place_iceberg(&mut book, 1, 100, Side::Ask, 50, 100, 20);
+        // Total resting orders: 1 (single iceberg)
+        assert_eq!(book.total_resting_orders(), 1);
+        let order = book.get_order(OrderId(1)).unwrap();
+        assert_eq!(order.size_remaining, Size(20));
+        assert_eq!(order.hidden_remaining, Size(80));
+        assert_eq!(order.visible_slice, Size(20));
+    }
+
+    #[test]
+    fn iceberg_refreshes_next_slice_when_visible_filled() {
+        let mut book = SpotOrderBook::new(SymbolId(1));
+        place_iceberg(&mut book, 1, 100, Side::Ask, 50, 100, 20);
+
+        // Taker buys 20 — exactly the visible slice.
+        let r = place(&mut book, 2, 200, Side::Bid, 50, 20, TimeInForce::Ioc);
+        assert_eq!(r.trades.len(), 1);
+        assert_eq!(r.trades[0].size, Size(20));
+
+        // Iceberg should have refreshed: visible 20, hidden 60.
+        let order = book.get_order(OrderId(1)).unwrap();
+        assert_eq!(order.size_remaining, Size(20));
+        assert_eq!(order.hidden_remaining, Size(60));
+    }
+
+    #[test]
+    fn iceberg_consumes_all_slices_across_multiple_takers() {
+        let mut book = SpotOrderBook::new(SymbolId(1));
+        place_iceberg(&mut book, 1, 100, Side::Ask, 50, 100, 25);
+
+        // Single 100 taker should consume all 4 slices.
+        let r = place(&mut book, 2, 200, Side::Bid, 50, 100, TimeInForce::Ioc);
+        // Each slice produces one trade.
+        let total_filled: i64 = r.trades.iter().map(|t| t.size.raw()).sum();
+        assert_eq!(total_filled, 100);
+        // Iceberg fully drained.
+        assert!(book.get_order(OrderId(1)).is_none());
+    }
+
+    #[test]
+    fn iceberg_remainder_smaller_than_slice_emerges_intact() {
+        let mut book = SpotOrderBook::new(SymbolId(1));
+        // 50 total, 20 slice → last slice is 10.
+        place_iceberg(&mut book, 1, 100, Side::Ask, 50, 50, 20);
+
+        place(&mut book, 2, 200, Side::Bid, 50, 20, TimeInForce::Ioc);
+        place(&mut book, 3, 200, Side::Bid, 50, 20, TimeInForce::Ioc);
+        // After 40 filled, last slice = 10.
+        let order = book.get_order(OrderId(1)).unwrap();
+        assert_eq!(order.size_remaining, Size(10));
+        assert_eq!(order.hidden_remaining, Size(0));
+    }
+
+    #[test]
+    fn iceberg_loses_time_priority_on_refresh() {
+        let mut book = SpotOrderBook::new(SymbolId(1));
+        // Iceberg first (will be head initially).
+        place_iceberg(&mut book, 1, 100, Side::Ask, 50, 100, 10);
+        // Regular order at same price (FIFO behind iceberg).
+        place(&mut book, 2, 101, Side::Ask, 50, 5, TimeInForce::Gtc);
+
+        // Taker buys 10 — fills first iceberg slice completely.
+        place(&mut book, 3, 200, Side::Bid, 50, 10, TimeInForce::Ioc);
+        // After the slice is consumed and refreshed, iceberg moves to tail.
+        // Next taker buys 5 — should hit the regular order (oid=2), NOT the
+        // refreshed iceberg slice.
+        let r = place(&mut book, 4, 200, Side::Bid, 50, 5, TimeInForce::Ioc);
+        assert_eq!(r.trades.len(), 1);
+        assert_eq!(r.trades[0].maker_order_id, OrderId(2));
+    }
+
+    #[test]
+    fn iceberg_rejects_visible_larger_than_size() {
+        let mut book = SpotOrderBook::new(SymbolId(1));
+        let r = place_iceberg(&mut book, 1, 100, Side::Ask, 50, 100, 150);
+        assert!(matches!(r.reject, Some(RejectReason::UnsupportedCommand)));
+    }
+
+    #[test]
+    fn iceberg_rejects_zero_visible() {
+        let mut book = SpotOrderBook::new(SymbolId(1));
+        let r = place_iceberg(&mut book, 1, 100, Side::Ask, 50, 100, 0);
+        assert!(matches!(r.reject, Some(RejectReason::UnsupportedCommand)));
     }
 
     #[test]
