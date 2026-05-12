@@ -98,7 +98,8 @@ cargo fmt --all
 | M4.1 | Derivative `Position` + isolated `margin_locked`, perp/future pre-check + settle for open/increase orders | ✅ done |
 | M4.2 | Reduce/close orders + realized PnL at fill price + mark-aware conservation (`total_internal_with_marks`) | ✅ done |
 | M4.3 | Flip-in-one-order, `Command::SetMarkPrice` + liquidation, `Command::ApplyFunding`, `Command::SettleFuture`, derivative property test, tracing on hot paths | ✅ done |
-| **M5.1** | Self-trade prevention: CancelTaker / CancelMaker / CancelBoth / DecrementAndCancel; partial hold release for DAC partial-reduce | ✅ done |
+| M5.1 | Self-trade prevention: CancelTaker / CancelMaker / CancelBoth / DecrementAndCancel; partial hold release for DAC partial-reduce | ✅ done |
+| **M5.2** | Market orders (lower to Limit-at-reserve + IOC) + Iceberg orders (visible/hidden slices, refresh + relink-to-tail) + Stop orders (pending until mark crosses, then triggered into a Limit) | ✅ done |
 | M5 | Productionization: tracing/Prometheus, fuzz suite, CI, stress tests, gray-release config, true 3-thread R1/Match/R2 via UID sharding | pending |
 
 Each milestone is independently shippable. Don't start M(n+1) work in M(n) — keep the boundary clean.

@@ -6,6 +6,16 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use tracing::{debug, trace};
 
+/// Returns true if the mark price has crossed the stop trigger for an order
+/// of the given side. Buy stop (Bid): triggers when mark >= stop. Sell stop
+/// (Ask): triggers when mark <= stop.
+fn stop_trigger_met(side: Side, mark: Price, stop: Price) -> bool {
+    match side {
+        Side::Bid => mark.raw() >= stop.raw(),
+        Side::Ask => mark.raw() <= stop.raw(),
+    }
+}
+
 use me_matching::{PlaceParams, SpotOrderBook};
 use me_risk::RiskEngine;
 use me_types::{
@@ -15,6 +25,18 @@ use me_types::{
     Side, SymbolId, SymbolKindParams, SymbolSpec, TimeInForce, Timestamp, UserId,
 };
 use me_wal::{SnapshotStore, WalWriter};
+
+/// A Stop order awaiting its trigger price. Lives in `EngineSnapshot.pending_stops`
+/// until `SetMarkPrice` moves the mark through the trigger; then the underlying
+/// Limit/Market portion is submitted to the book under the same `order_id`
+/// (the risk hold is already in place from the placement-time pre-check).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingStop {
+    pub order_id: OrderId,
+    /// The order to submit when triggered. For StopMarket variants the price
+    /// field has already been lowered to the reserve_price (Bid) or zero (Ask).
+    pub place_order: PlaceOrder,
+}
 
 /// Persistent state of the engine — everything that survives a restart.
 /// The `MatchingEngine` wraps this plus runtime handles (WAL writer,
@@ -27,6 +49,11 @@ pub struct EngineSnapshot {
     /// Latest mark prices per derivative symbol. Set via Command::SetMarkPrice;
     /// used by liquidation, funding, and mark-aware conservation totals.
     pub mark_prices: AHashMap<SymbolId, Price>,
+    /// Pending Stop orders, keyed by symbol. Each entry was pre-checked at
+    /// placement (the user's hold is already locked) and is just waiting for
+    /// the mark price to cross its `stop_price`.
+    #[serde(default)]
+    pub pending_stops: AHashMap<SymbolId, Vec<PendingStop>>,
     pub next_seq_no: u64,
     pub next_order_id: u64,
     pub last_applied_seq: SeqNo,
@@ -53,6 +80,7 @@ impl MatchingEngine {
                 books: AHashMap::new(),
                 symbols: AHashMap::new(),
                 mark_prices: AHashMap::new(),
+                pending_stops: AHashMap::new(),
                 next_seq_no: 1,
                 next_order_id: 1,
                 last_applied_seq: SeqNo(0),
@@ -139,27 +167,74 @@ impl MatchingEngine {
         }
     }
 
-    fn handle_set_mark_price(&mut self, seq_no: SeqNo, cmd: SetMarkPrice) -> CommandReceipt {
+    fn handle_set_mark_price(
+        &mut self,
+        seq_no: SeqNo,
+        cmd: SetMarkPrice,
+        now: Timestamp,
+    ) -> CommandReceipt {
+        // Mark price applies to derivative symbols for liquidation logic, but
+        // also to spot symbols for stop-order triggering. Update the mark
+        // unconditionally; only run the derivative-specific liquidation sweep
+        // if the symbol is a derivative.
         let Some(spec) = self.state.symbols.get(&cmd.symbol_id).cloned() else {
             return CommandReceipt::rejected(seq_no, RejectReason::UnknownSymbol);
         };
-        if matches!(spec.kind_params, SymbolKindParams::Spot) {
-            return CommandReceipt::rejected(seq_no, RejectReason::UnsupportedCommand);
-        }
         self.state.mark_prices.insert(cmd.symbol_id, cmd.mark_price);
-        let reports = self.state.risk.scan_liquidations(&spec, cmd.mark_price);
-        if !reports.is_empty() {
-            debug!(
-                symbol_id = cmd.symbol_id.0,
-                liquidations = reports.len(),
-                "mark price update triggered liquidations"
-            );
+
+        if !matches!(spec.kind_params, SymbolKindParams::Spot) {
+            let reports = self.state.risk.scan_liquidations(&spec, cmd.mark_price);
+            if !reports.is_empty() {
+                debug!(
+                    symbol_id = cmd.symbol_id.0,
+                    liquidations = reports.len(),
+                    "mark price update triggered liquidations"
+                );
+            }
         }
+
+        // Trigger any pending stops whose condition is satisfied at the new mark.
+        let triggered = self.drain_triggered_stops(cmd.symbol_id, cmd.mark_price);
+        let mut events: SmallVec<[Event; 4]> = SmallVec::new();
+        for mut stop in triggered {
+            // Lower order_type to Limit; the price/TIF were already set at
+            // placement time. The hold is still in place from pre_check.
+            stop.place_order.order_type = OrderType::Limit;
+            let (_status, stop_events) =
+                self.apply_to_book(stop.order_id, &stop.place_order, &spec, now);
+            // Fold each triggered-stop's lifecycle into this SetMarkPrice
+            // receipt. Consumers learn from these events that the stop fired.
+            for ev in stop_events {
+                events.push(ev);
+            }
+        }
+
         CommandReceipt {
             seq_no,
             status: CommandStatus::Accepted,
-            events: SmallVec::new(),
+            events,
         }
+    }
+
+    /// Drain pending stops on `symbol_id` whose trigger condition is now met.
+    fn drain_triggered_stops(&mut self, symbol_id: SymbolId, mark: Price) -> Vec<PendingStop> {
+        let Some(pending) = self.state.pending_stops.get_mut(&symbol_id) else {
+            return Vec::new();
+        };
+        let mut triggered = Vec::new();
+        let mut still_pending = Vec::with_capacity(pending.len());
+        for stop in pending.drain(..) {
+            let Some(stop_price) = stop.place_order.stop_price else {
+                continue; // invariant: only orders with stop_price land here
+            };
+            if stop_trigger_met(stop.place_order.side, mark, stop_price) {
+                triggered.push(stop);
+            } else {
+                still_pending.push(stop);
+            }
+        }
+        *pending = still_pending;
+        triggered
     }
 
     fn handle_apply_funding(&mut self, seq_no: SeqNo, cmd: ApplyFunding) -> CommandReceipt {
@@ -325,7 +400,7 @@ impl MatchingEngine {
                 self.handle_cancel(seq_no, c.user_id, c.symbol_id, c.order_id, now)
             }
             Command::RegisterSymbol(spec) => self.handle_register_symbol(seq_no, spec.clone()),
-            Command::SetMarkPrice(m) => self.handle_set_mark_price(seq_no, m.clone()),
+            Command::SetMarkPrice(m) => self.handle_set_mark_price(seq_no, m.clone(), now),
             Command::ApplyFunding(f) => self.handle_apply_funding(seq_no, f.clone()),
             Command::SettleFuture(s) => self.handle_settle_future(seq_no, s.clone()),
             Command::ModifyOrder(_) => {
@@ -357,12 +432,17 @@ impl MatchingEngine {
             None => return Self::reject_place(seq_no, &p, now, RejectReason::UnknownSymbol),
         };
 
-        // Lower Market to a Limit-at-reserve with forced IOC. A Market Bid
-        // needs *some* upper bound for the risk hold; we use the caller's
-        // reserve_price (or price if reserve is omitted). A Market Ask
-        // accepts any positive bid, so we drop the floor to 0.
         let mut p = p;
-        if matches!(p.order_type, OrderType::Market) {
+        // Lower Market / StopMarket to a Limit-at-bound. A Market Bid needs
+        // *some* upper bound for the risk hold; we use the caller's reserve
+        // (or price if reserve is omitted). Ask side accepts any positive
+        // bid, so the floor drops to 0. Time-in-force is forced to Ioc so
+        // the Market portion never rests.
+        let is_market_like = matches!(
+            p.order_type,
+            OrderType::Market | OrderType::StopMarket
+        );
+        if is_market_like {
             match p.side {
                 Side::Bid => {
                     let bound = p.reserve_price.or(p.price);
@@ -370,8 +450,6 @@ impl MatchingEngine {
                         Some(price) => {
                             p.price = Some(price);
                             p.reserve_price = Some(price);
-                            p.order_type = OrderType::Limit;
-                            p.time_in_force = TimeInForce::Ioc;
                         }
                         None => {
                             return Self::reject_place(seq_no, &p, now, RejectReason::MissingPrice);
@@ -380,9 +458,15 @@ impl MatchingEngine {
                 }
                 Side::Ask => {
                     p.price = Some(Price(0));
-                    p.order_type = OrderType::Limit;
-                    p.time_in_force = TimeInForce::Ioc;
                 }
+            }
+            if matches!(p.order_type, OrderType::Market) {
+                p.order_type = OrderType::Limit;
+                p.time_in_force = TimeInForce::Ioc;
+            } else {
+                // StopMarket — keep order_type to signal "pend until trigger",
+                // but at trigger time we'll lower further to Limit + IOC.
+                p.time_in_force = TimeInForce::Ioc;
             }
         }
 
@@ -390,6 +474,59 @@ impl MatchingEngine {
             return Self::reject_place(seq_no, &p, now, r);
         }
 
+        // Stop dispatch. If the stop's trigger condition isn't currently
+        // satisfied by the mark, register it in pending_stops; otherwise
+        // fall through to the book using the lowered limit semantics.
+        if matches!(p.order_type, OrderType::StopLimit | OrderType::StopMarket) {
+            let Some(stop_price) = p.stop_price else {
+                let _ = self.state.risk.release_hold(order_id);
+                return Self::reject_place(seq_no, &p, now, RejectReason::MissingPrice);
+            };
+            let mark = self.state.mark_prices.get(&p.symbol_id).copied();
+            let triggered = matches!(mark, Some(m) if stop_trigger_met(p.side, m, stop_price));
+            if !triggered {
+                self.state
+                    .pending_stops
+                    .entry(p.symbol_id)
+                    .or_default()
+                    .push(PendingStop {
+                        order_id,
+                        place_order: p.clone(),
+                    });
+                let mut events: SmallVec<[Event; 4]> = SmallVec::new();
+                events.push(Event::OrderAccepted(OrderAccepted {
+                    order_id,
+                    client_order_id: p.client_order_id,
+                    user_id: p.user_id,
+                    symbol_id: p.symbol_id,
+                    timestamp: now,
+                }));
+                return CommandReceipt {
+                    seq_no,
+                    status: CommandStatus::Accepted,
+                    events,
+                };
+            }
+            // Already past the trigger — lower to Limit and place now.
+            p.order_type = OrderType::Limit;
+        }
+
+        let (status, events) = self.apply_to_book(order_id, &p, &spec, now);
+        CommandReceipt { seq_no, status, events }
+    }
+
+    /// Run book.place + settlement for an order that already has a registered
+    /// risk hold (allocated at pre_check_place time). Used by both
+    /// fresh-placement handle_place and pending-stop triggers, so the
+    /// downstream settlement (apply_trade, release_hold on STP/IOC, event
+    /// emission) lives in exactly one place.
+    fn apply_to_book(
+        &mut self,
+        order_id: OrderId,
+        p: &PlaceOrder,
+        spec: &SymbolSpec,
+        now: Timestamp,
+    ) -> (CommandStatus, SmallVec<[Event; 4]>) {
         let book = self
             .state
             .books
@@ -412,20 +549,24 @@ impl MatchingEngine {
 
         if let Some(reason) = outcome.reject {
             let _ = self.state.risk.release_hold(order_id);
-            return Self::reject_place(seq_no, &p, now, reason);
+            let mut events: SmallVec<[Event; 4]> = SmallVec::new();
+            events.push(Event::OrderRejected(OrderRejected {
+                client_order_id: p.client_order_id,
+                user_id: p.user_id,
+                symbol_id: p.symbol_id,
+                reason,
+                timestamp: now,
+            }));
+            return (CommandStatus::Rejected(reason), events);
         }
 
         for trade in &outcome.trades {
             self.state
                 .risk
-                .apply_trade(trade, &spec)
+                .apply_trade(trade, spec)
                 .expect("apply_trade should not fail in a consistent state");
         }
 
-        // Release holds for any maker cancelled by self-trade prevention.
-        // Full-cancel: release entire remaining hold and drop the Hold record.
-        // Partial (DecrementAndCancel maker > taker): release the proportional
-        // portion of the hold; the maker stays on the book with reduced size.
         for stp_cancel in &outcome.stp_cancellations {
             if stp_cancel.full_cancel {
                 let _ = self.state.risk.release_hold(stp_cancel.order_id);
@@ -452,8 +593,6 @@ impl MatchingEngine {
         for trade in outcome.trades.iter().cloned() {
             events.push(Event::Trade(trade));
         }
-        // Emit an OrderCancelled event per STP-affected maker (full cancels
-        // only — partial reduces are state changes, not lifecycle events).
         for stp_cancel in &outcome.stp_cancellations {
             if stp_cancel.full_cancel {
                 events.push(Event::OrderCancelled(OrderCancelled {
@@ -498,7 +637,7 @@ impl MatchingEngine {
             CommandStatus::Accepted
         };
 
-        CommandReceipt { seq_no, status, events }
+        (status, events)
     }
 
     fn handle_cancel(
@@ -889,6 +1028,155 @@ mod tests {
         deposit(&mut eng, 1, 2, 10_000_000_000);
 
         let r = place_market(&mut eng, 1, 1, Side::Bid, None, 50_000_000);
+        assert!(matches!(r.status, CommandStatus::Rejected(RejectReason::MissingPrice)));
+    }
+
+    // ---- Stop orders (M5.2.c) ----
+
+    fn place_stop_limit(
+        eng: &mut MatchingEngine,
+        uid: u64,
+        coid: u64,
+        side: Side,
+        stop_price: i64,
+        limit_price: i64,
+        size: i64,
+    ) -> CommandReceipt {
+        eng.submit(
+            Command::PlaceOrder(PlaceOrder {
+                user_id: UserId(uid),
+                symbol_id: SymbolId(1),
+                client_order_id: ClientOrderId(coid),
+                side,
+                order_type: OrderType::StopLimit,
+                time_in_force: TimeInForce::Gtc,
+                price: Some(Price(limit_price)),
+                size: Size(size),
+                reserve_price: None,
+                stop_price: Some(Price(stop_price)),
+                visible_size: None,
+                self_trade_prevention: SelfTradePrevention::None,
+            }),
+            Timestamp(0),
+        )
+    }
+
+    fn set_mark(eng: &mut MatchingEngine, price: i64) {
+        eng.submit(
+            Command::SetMarkPrice(me_types::SetMarkPrice {
+                symbol_id: SymbolId(1),
+                mark_price: Price(price),
+            }),
+            Timestamp(0),
+        );
+    }
+
+    #[test]
+    fn stop_pending_until_mark_crosses() {
+        let mut eng = build_engine();
+        add_user(&mut eng, 1);
+        add_user(&mut eng, 2);
+        deposit(&mut eng, 1, 1, 100_000_000);
+        deposit(&mut eng, 2, 2, 10_000_000_000);
+
+        // Resting ask at 50e6 so a triggered buy stop has liquidity.
+        place(&mut eng, 1, 1, Side::Ask, 50_000_000, 100_000_000, TimeInForce::Gtc);
+        // Buy stop @ 55e6 with limit 60e6. Mark unset/below 55 → pending.
+        let r = place_stop_limit(&mut eng, 2, 2, Side::Bid, 55_000_000, 60_000_000, 50_000_000);
+        assert_eq!(r.status, CommandStatus::Accepted);
+        // No trade yet — the resting ask is untouched.
+        assert_eq!(eng.book(SymbolId(1)).unwrap().best_ask(), Some(Price(50_000_000)));
+    }
+
+    #[test]
+    fn buy_stop_triggers_when_mark_reaches_stop_price() {
+        let mut eng = build_engine();
+        add_user(&mut eng, 1);
+        add_user(&mut eng, 2);
+        deposit(&mut eng, 1, 1, 100_000_000);
+        deposit(&mut eng, 2, 2, 10_000_000_000);
+
+        place(&mut eng, 1, 1, Side::Ask, 50_000_000, 100_000_000, TimeInForce::Gtc);
+        place_stop_limit(&mut eng, 2, 2, Side::Bid, 55_000_000, 60_000_000, 50_000_000);
+
+        // Mark rises to 55e6 → stop triggers.
+        let r = eng.submit(
+            Command::SetMarkPrice(me_types::SetMarkPrice {
+                symbol_id: SymbolId(1),
+                mark_price: Price(55_000_000),
+            }),
+            Timestamp(0),
+        );
+        // The triggered stop's events fold into the SetMarkPrice receipt.
+        let trade = r.events.iter().find_map(|e| match e {
+            Event::Trade(t) => Some(t.clone()),
+            _ => None,
+        });
+        let trade = trade.expect("expected a trade from the triggered stop");
+        // Bought 50M of the resting 100M ask at fill price 50e6 (maker's price).
+        assert_eq!(trade.size, Size(50_000_000));
+        assert_eq!(trade.price, Price(50_000_000));
+        // 50M of the original 100M ask remains on the book.
+        assert_eq!(eng.book(SymbolId(1)).unwrap().best_ask(), Some(Price(50_000_000)));
+    }
+
+    #[test]
+    fn sell_stop_triggers_when_mark_falls() {
+        let mut eng = build_engine();
+        add_user(&mut eng, 1);
+        add_user(&mut eng, 2);
+        deposit(&mut eng, 1, 1, 100_000_000);
+        deposit(&mut eng, 2, 2, 10_000_000_000);
+
+        // Resting bid at 40e6.
+        place(&mut eng, 2, 1, Side::Bid, 40_000_000, 50_000_000, TimeInForce::Gtc);
+        // Sell stop @ 45e6 with limit 39e6. Mark not set → pending.
+        place_stop_limit(&mut eng, 1, 2, Side::Ask, 45_000_000, 39_000_000, 50_000_000);
+
+        // Set mark BELOW the stop price → triggers.
+        set_mark(&mut eng, 44_000_000);
+        // Bid consumed.
+        assert!(eng.book(SymbolId(1)).unwrap().best_bid().is_none());
+    }
+
+    #[test]
+    fn stop_does_not_trigger_if_mark_doesnt_cross() {
+        let mut eng = build_engine();
+        add_user(&mut eng, 1);
+        add_user(&mut eng, 2);
+        deposit(&mut eng, 1, 1, 100_000_000);
+        deposit(&mut eng, 2, 2, 10_000_000_000);
+
+        place(&mut eng, 1, 1, Side::Ask, 50_000_000, 100_000_000, TimeInForce::Gtc);
+        place_stop_limit(&mut eng, 2, 2, Side::Bid, 55_000_000, 60_000_000, 50_000_000);
+
+        // Mark moves but doesn't reach 55e6.
+        set_mark(&mut eng, 54_999_999);
+        assert!(eng.book(SymbolId(1)).unwrap().best_ask().is_some());
+    }
+
+    #[test]
+    fn stop_without_stop_price_rejects() {
+        let mut eng = build_engine();
+        add_user(&mut eng, 1);
+        deposit(&mut eng, 1, 2, 10_000_000_000);
+        let r = eng.submit(
+            Command::PlaceOrder(PlaceOrder {
+                user_id: UserId(1),
+                symbol_id: SymbolId(1),
+                client_order_id: ClientOrderId(1),
+                side: Side::Bid,
+                order_type: OrderType::StopLimit,
+                time_in_force: TimeInForce::Gtc,
+                price: Some(Price(60_000_000)),
+                size: Size(50_000_000),
+                reserve_price: None,
+                stop_price: None,
+                visible_size: None,
+                self_trade_prevention: SelfTradePrevention::None,
+            }),
+            Timestamp(0),
+        );
         assert!(matches!(r.status, CommandStatus::Rejected(RejectReason::MissingPrice)));
     }
 

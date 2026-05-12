@@ -4,7 +4,7 @@ English | [中文](./README.md)
 
 Production-targeted matching engine for spot + perpetual/futures, written in Rust.
 
-> **Status: M5.1 (self-trade prevention) complete on top of M4.** All four STP strategies (CancelTaker / CancelMaker / CancelBoth / DecrementAndCancel) are wired through the matching engine; STP-cancelled makers have their risk holds released (partial for DAC partial-reduce). `filled` now reflects actual trade volume only.
+> **Status: M5.2 (order types) complete.** Market (lower to Limit-at-bound + force IOC), Iceberg (visible/hidden slices that refresh and relink to FIFO tail on consumption), and Stop (pending until `SetMarkPrice` moves the mark across `stop_price`, then triggered into a Limit) all wired through the engine. M5.1 self-trade prevention, M4 derivatives, and M3 persistence all preserved. See `CLAUDE.md`.
 
 ## Design goals
 

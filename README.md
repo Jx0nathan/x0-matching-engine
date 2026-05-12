@@ -4,7 +4,7 @@
 
 面向生产的撮合引擎，覆盖现货 + 永续/期货，使用 Rust 编写。
 
-> **当前状态：M5.1（自成交保护）完成 on top of M4。** 4 种 STP 策略（CancelTaker / CancelMaker / CancelBoth / DecrementAndCancel）全部接入撮合主循环；DAC 部分平仓时风控按比例释放对应保证金。`filled` 现在只算真实成交量（STP 中和的不算）。路线图详见 `CLAUDE.md`。
+> **当前状态：M5.2（订单类型完整）完成。** Market（一键最坏价格 IOC）、Iceberg（可见 + 隐藏切片，切片消耗后重排到队尾失去时间优先）、Stop（StopLimit / StopMarket，挂在 pending_stops，SetMarkPrice 跨过 stop_price 时触发）全部接入。M5.1 的自成交保护、M4 的衍生品、M3 的持久化与并发一并保留。路线图详见 `CLAUDE.md`。
 
 ## 设计目标
 
