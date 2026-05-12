@@ -4,13 +4,15 @@ use ahash::AHashMap;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
+use tracing::{debug, trace};
 
 use me_matching::{PlaceParams, SpotOrderBook};
 use me_risk::RiskEngine;
 use me_types::{
-    AdjustBalance, Command, CommandEnvelope, CommandReceipt, CommandStatus, Event, OrderAccepted,
-    OrderCancelled, OrderFilled, OrderId, OrderPartiallyFilled, OrderRejected, PlaceOrder,
-    RejectReason, SeqNo, SymbolId, SymbolSpec, Timestamp, UserId,
+    AdjustBalance, ApplyFunding, Command, CommandEnvelope, CommandReceipt, CommandStatus,
+    CurrencyId, Event, OrderAccepted, OrderCancelled, OrderFilled, OrderId, OrderPartiallyFilled,
+    OrderRejected, PlaceOrder, Price, RejectReason, SeqNo, SetMarkPrice, SettleFuture, SymbolId,
+    SymbolKindParams, SymbolSpec, Timestamp, UserId,
 };
 use me_wal::{SnapshotStore, WalWriter};
 
@@ -22,6 +24,9 @@ pub struct EngineSnapshot {
     pub risk: RiskEngine,
     pub books: AHashMap<SymbolId, SpotOrderBook>,
     pub symbols: AHashMap<SymbolId, SymbolSpec>,
+    /// Latest mark prices per derivative symbol. Set via Command::SetMarkPrice;
+    /// used by liquidation, funding, and mark-aware conservation totals.
+    pub mark_prices: AHashMap<SymbolId, Price>,
     pub next_seq_no: u64,
     pub next_order_id: u64,
     pub last_applied_seq: SeqNo,
@@ -47,6 +52,7 @@ impl MatchingEngine {
                 risk: RiskEngine::new(),
                 books: AHashMap::new(),
                 symbols: AHashMap::new(),
+                mark_prices: AHashMap::new(),
                 next_seq_no: 1,
                 next_order_id: 1,
                 last_applied_seq: SeqNo(0),
@@ -54,6 +60,22 @@ impl MatchingEngine {
             wal: None,
             snapshot_store: None,
         }
+    }
+
+    pub fn mark_price(&self, symbol_id: SymbolId) -> Option<Price> {
+        self.state.mark_prices.get(&symbol_id).copied()
+    }
+
+    /// Conservation total in a currency, including unrealized PnL from every
+    /// open derivative position evaluated at its stored mark price.
+    /// Symbols without a mark contribute zero unrealized PnL (positions in
+    /// them just count their margin_locked).
+    pub fn total_internal_with_marks(&self, currency: CurrencyId) -> i128 {
+        self.state.risk.total_internal_with_marks(currency, |sid| {
+            let mark = self.state.mark_prices.get(&sid).copied()?;
+            let scale = self.state.symbols.get(&sid).map(|s| s.base_minor_per_major)?;
+            Some((mark, scale))
+        })
     }
 
     /// Open an engine with persistence backing. On open: load the latest
@@ -117,6 +139,69 @@ impl MatchingEngine {
         }
     }
 
+    fn handle_set_mark_price(&mut self, seq_no: SeqNo, cmd: SetMarkPrice) -> CommandReceipt {
+        let Some(spec) = self.state.symbols.get(&cmd.symbol_id).cloned() else {
+            return CommandReceipt::rejected(seq_no, RejectReason::UnknownSymbol);
+        };
+        if matches!(spec.kind_params, SymbolKindParams::Spot) {
+            return CommandReceipt::rejected(seq_no, RejectReason::UnsupportedCommand);
+        }
+        self.state.mark_prices.insert(cmd.symbol_id, cmd.mark_price);
+        let reports = self.state.risk.scan_liquidations(&spec, cmd.mark_price);
+        if !reports.is_empty() {
+            debug!(
+                symbol_id = cmd.symbol_id.0,
+                liquidations = reports.len(),
+                "mark price update triggered liquidations"
+            );
+        }
+        CommandReceipt {
+            seq_no,
+            status: CommandStatus::Accepted,
+            events: SmallVec::new(),
+        }
+    }
+
+    fn handle_apply_funding(&mut self, seq_no: SeqNo, cmd: ApplyFunding) -> CommandReceipt {
+        let Some(spec) = self.state.symbols.get(&cmd.symbol_id).cloned() else {
+            return CommandReceipt::rejected(seq_no, RejectReason::UnknownSymbol);
+        };
+        if !matches!(spec.kind_params, SymbolKindParams::PerpetualSwap(_)) {
+            return CommandReceipt::rejected(seq_no, RejectReason::UnsupportedCommand);
+        }
+        let Some(mark) = self.state.mark_prices.get(&cmd.symbol_id).copied() else {
+            // Need a mark to compute funding.
+            return CommandReceipt::rejected(seq_no, RejectReason::InvalidOrderBookState);
+        };
+        let _reports = self.state.risk.apply_funding(&spec, mark, cmd.rate_bps);
+        CommandReceipt {
+            seq_no,
+            status: CommandStatus::Accepted,
+            events: SmallVec::new(),
+        }
+    }
+
+    fn handle_settle_future(&mut self, seq_no: SeqNo, cmd: SettleFuture) -> CommandReceipt {
+        let spec = match self.state.symbols.get(&cmd.symbol_id).cloned() {
+            Some(s) => s,
+            None => return CommandReceipt::rejected(seq_no, RejectReason::UnknownSymbol),
+        };
+        if !matches!(spec.kind_params, SymbolKindParams::Future(_)) {
+            return CommandReceipt::rejected(seq_no, RejectReason::UnsupportedCommand);
+        }
+        let _reports = self.state.risk.settle_all_positions(&spec, cmd.settlement_price);
+        // Suspend the expired symbol so no new orders are accepted.
+        if let Some(s) = self.state.symbols.get_mut(&cmd.symbol_id) {
+            s.is_suspended = true;
+        }
+        self.state.mark_prices.insert(cmd.symbol_id, cmd.settlement_price);
+        CommandReceipt {
+            seq_no,
+            status: CommandStatus::Accepted,
+            events: SmallVec::new(),
+        }
+    }
+
     pub fn risk(&self) -> &RiskEngine {
         &self.state.risk
     }
@@ -145,14 +230,17 @@ impl MatchingEngine {
         Ok(seq)
     }
 
+    #[tracing::instrument(skip_all, fields(seq_no))]
     pub fn submit(&mut self, cmd: Command, now: Timestamp) -> CommandReceipt {
         let seq_no = SeqNo(self.state.next_seq_no);
         self.state.next_seq_no += 1;
+        tracing::Span::current().record("seq_no", seq_no.0);
         let env = CommandEnvelope { seq_no, received_at: now, command: cmd };
 
         if let Some(wal) = &mut self.wal {
             wal.append(&env).expect("WAL append failed");
             wal.sync().expect("WAL sync failed");
+            trace!(seq = seq_no.0, "WAL synced");
         }
 
         self.apply_envelope(&env)
@@ -163,9 +251,8 @@ impl MatchingEngine {
     /// the fsync cost over the batch — the canonical group-commit pattern.
     ///
     /// Durability invariant preserved: by the time any receipt is returned,
-    /// every record in the batch is on durable storage. (We fsync before
-    /// applying, so even an apply-time panic leaves the WAL ahead of state,
-    /// which is fine — restore replays the missed apply.)
+    /// every record in the batch is on durable storage.
+    #[tracing::instrument(skip_all, fields(batch_size = cmds.len()))]
     pub fn submit_batch(
         &mut self,
         cmds: Vec<(Command, Timestamp)>,
@@ -185,6 +272,7 @@ impl MatchingEngine {
                 wal.append(env).expect("WAL append failed");
             }
             wal.sync().expect("WAL sync failed");
+            debug!(batch_size = envs.len(), "WAL group-commit synced");
         }
 
         envs.iter().map(|env| self.apply_envelope(env)).collect()
@@ -237,6 +325,9 @@ impl MatchingEngine {
                 self.handle_cancel(seq_no, c.user_id, c.symbol_id, c.order_id, now)
             }
             Command::RegisterSymbol(spec) => self.handle_register_symbol(seq_no, spec.clone()),
+            Command::SetMarkPrice(m) => self.handle_set_mark_price(seq_no, m.clone()),
+            Command::ApplyFunding(f) => self.handle_apply_funding(seq_no, f.clone()),
+            Command::SettleFuture(s) => self.handle_settle_future(seq_no, s.clone()),
             Command::ModifyOrder(_) => {
                 CommandReceipt::rejected(seq_no, RejectReason::UnsupportedCommand)
             }

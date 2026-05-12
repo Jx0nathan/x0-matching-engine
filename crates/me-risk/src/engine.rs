@@ -6,6 +6,26 @@ use me_types::{
     Side, Size, SymbolId, SymbolKindParams, SymbolSpec, Trade, UserId,
 };
 
+/// Description of one underwater position that the engine force-closed.
+#[derive(Debug, Clone)]
+pub struct LiquidationReport {
+    pub user_id: UserId,
+    pub symbol_id: SymbolId,
+    pub size_closed: Size,
+    pub close_price: Price,
+    pub realized_pnl: Amount,
+    pub margin_released: Amount,
+}
+
+/// One user's funding payment for the latest settlement.
+#[derive(Debug, Clone)]
+pub struct FundingReport {
+    pub user_id: UserId,
+    pub symbol_id: SymbolId,
+    /// Signed: positive = user paid, negative = user received.
+    pub payment: Amount,
+}
+
 use crate::account::UserAccount;
 
 /// Sentinel UserId reserved for the exchange's fee-revenue account.
@@ -142,41 +162,58 @@ impl RiskEngine {
 
     /// Conservation total including mark-to-market unrealized PnL.
     /// `mark_for(symbol)` returns `Some((mark_price, base_minor_per_major))`
-    /// for each symbol with a current mark, `None` otherwise. Positions on
-    /// symbols without a mark contribute zero unrealized PnL.
+    /// for each symbol with a current mark, `None` otherwise.
     ///
     /// Invariant: for any fixed mark mapping, this total stays constant
     /// across all engine operations (trades, fills, fees) modulo external
     /// deposits/withdrawals.
+    ///
+    /// Implementation note: we accumulate per-symbol unrealized PnL as the
+    /// pre-divided integer `(mark − entry) × size` sum, dividing by `scale`
+    /// once at the end. Truncating per-position would lose sub-unit precision
+    /// asymmetrically between long and short legs and break conservation by
+    /// ±1 unit per imbalance — exactly the off-by-one that the property test
+    /// would otherwise catch.
     pub fn total_internal_with_marks<F>(&self, currency: CurrencyId, mark_for: F) -> i128
     where
         F: Fn(SymbolId) -> Option<(Price, i64)>,
     {
-        self.accounts
-            .values()
-            .map(|a| {
-                let balance_part =
-                    a.free(currency).raw() as i128 + a.held(currency).raw() as i128;
-                let position_part: i128 = a
-                    .positions
-                    .iter()
-                    .filter(|(_, p)| p.margin_currency == currency)
-                    .map(|(symbol_id, p)| {
-                        let margin = p.margin_locked.raw() as i128;
-                        let unrealized = match mark_for(*symbol_id) {
-                            Some((mark, scale)) if p.size.raw() != 0 && scale > 0 => {
-                                let diff =
-                                    (mark.raw() as i128) - (p.entry_price.raw() as i128);
-                                diff * (p.size.raw() as i128) / (scale as i128)
-                            }
-                            _ => 0,
-                        };
-                        margin + unrealized
-                    })
-                    .sum();
-                balance_part + position_part
-            })
-            .sum()
+        let mut total: i128 = 0;
+        // (symbol_id) -> (sum of (mark-entry)×size, scale)
+        let mut per_symbol_unrealized_raw: ahash::AHashMap<SymbolId, (i128, i128)> =
+            ahash::AHashMap::new();
+
+        for account in self.accounts.values() {
+            total += account.free(currency).raw() as i128;
+            total += account.held(currency).raw() as i128;
+            for (symbol_id, position) in &account.positions {
+                if position.margin_currency != currency {
+                    continue;
+                }
+                total += position.margin_locked.raw() as i128;
+                if position.size.raw() == 0 {
+                    continue;
+                }
+                if let Some((mark, scale)) = mark_for(*symbol_id) {
+                    if scale <= 0 {
+                        continue;
+                    }
+                    let diff =
+                        (mark.raw() as i128) - (position.entry_price.raw() as i128);
+                    let raw = diff * (position.size.raw() as i128);
+                    let entry = per_symbol_unrealized_raw
+                        .entry(*symbol_id)
+                        .or_insert((0, scale as i128));
+                    entry.0 += raw;
+                }
+            }
+        }
+
+        for (_, (raw_sum, scale)) in &per_symbol_unrealized_raw {
+            total += raw_sum / scale;
+        }
+
+        total
     }
 
     pub fn pre_check_place(
@@ -313,35 +350,38 @@ impl RiskEngine {
             .get(&cmd.symbol_id)
             .map(|p| p.size.raw())
             .unwrap_or(0);
+        let current_margin = account
+            .positions
+            .get(&cmd.symbol_id)
+            .map(|p| p.margin_locked.raw())
+            .unwrap_or(0);
 
         let order_signed = match cmd.side {
             Side::Bid => cmd.size.raw(),
             Side::Ask => -cmd.size.raw(),
         };
-        // M4.2 supports reduce/close (opposite direction, |order| <= |current|).
-        // M4.2.beta will add flips (|order| > |current|). Reject flips for now.
-        let opposite_direction =
-            (current_signed > 0 && order_signed < 0) || (current_signed < 0 && order_signed > 0);
-        if opposite_direction && cmd.size.raw() > current_signed.unsigned_abs() as i64 {
-            return Err(RejectReason::UnsupportedCommand);
-        }
+        let new_signed = current_signed + order_signed;
+        let new_abs = new_signed.unsigned_abs() as i64;
+
+        // Worst-case required margin assuming the full order fills at the
+        // order's limit price. Handles open/increase, reduce/close, AND flip
+        // uniformly: net_margin_delta is zero when the post-fill position is
+        // already covered by the existing margin.
+        let new_notional = Amount::from_scaled_i128(
+            (price.raw() as i128) * (new_abs as i128),
+            spec.base_minor_per_major as i128,
+        )
+        .ok_or(RejectReason::ArithmeticOverflow)?;
+        let new_required_margin = new_notional
+            .mul_bps_ceil(params.initial_margin_bps)
+            .ok_or(RejectReason::ArithmeticOverflow)?;
+        let reserve_margin = Amount(new_required_margin.raw().saturating_sub(current_margin).max(0));
 
         let total_notional = quote_amount(price, cmd.size, spec)
             .ok_or(RejectReason::ArithmeticOverflow)?;
         let reserve_fee = total_notional
             .mul_bps_ceil(spec.fee_schedule.taker_bps)
             .ok_or(RejectReason::ArithmeticOverflow)?;
-
-        let reserve_margin = if opposite_direction {
-            // Closing/reducing: margin will be RELEASED from the position at
-            // settle, not added. Don't reserve any here.
-            Amount::ZERO
-        } else {
-            // Opening/increasing: reserve the full order's worth of margin.
-            total_notional
-                .mul_bps_ceil(params.initial_margin_bps)
-                .ok_or(RejectReason::ArithmeticOverflow)?
-        };
 
         let to_lock = reserve_margin
             .checked_add(reserve_fee)
@@ -550,8 +590,12 @@ impl RiskEngine {
             .get(&hold.symbol_id)
             .map(|p| p.size.raw())
             .unwrap_or(0);
-        let is_reducing =
+        let abs_contribution = contribution_signed.unsigned_abs() as i64;
+        let abs_prev = prev_signed.unsigned_abs() as i64;
+        let is_opposite =
             prev_signed != 0 && (prev_signed > 0) != (contribution_signed > 0);
+        let is_flip = is_opposite && abs_contribution > abs_prev;
+        let is_reducing = is_opposite && !is_flip;
 
         // Proportional drawdown of fee from this order's reserve.
         let reserved_fee_for_fill = Amount(
@@ -583,7 +627,18 @@ impl RiskEngine {
             SymbolKindParams::Spot => unreachable!("settle_derivative on spot symbol"),
         };
 
-        if is_reducing {
+        if is_flip {
+            self.settle_derivative_flip(
+                trade,
+                &mut hold,
+                contribution_signed,
+                actual_notional,
+                actual_fee,
+                reserved_total_for_fill,
+                imr_bps,
+                spec,
+            )?;
+        } else if is_reducing {
             self.settle_derivative_reduce(
                 trade,
                 &mut hold,
@@ -693,6 +748,100 @@ impl RiskEngine {
         Ok(())
     }
 
+    /// Settle a fill that closes the existing position AND opens a new one
+    /// in the opposite direction (flip). prev's margin is fully released to
+    /// free, PnL on the closed portion is realized at fill price, and a new
+    /// position is created at fill_price for the opened remainder.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_derivative_flip(
+        &mut self,
+        trade: &Trade,
+        hold: &mut Hold,
+        contribution_signed: i64,
+        _actual_notional: Amount,
+        actual_fee: Amount,
+        reserved_total_for_fill: Amount,
+        imr_bps: Bps,
+        spec: &SymbolSpec,
+    ) -> Result<(), RejectReason> {
+        let acct = self
+            .accounts
+            .get_mut(&hold.user_id)
+            .ok_or(RejectReason::UnknownUser)?;
+
+        // Read existing position snapshot (drop borrow before mutating).
+        let position = acct
+            .positions
+            .get(&hold.symbol_id)
+            .cloned()
+            .unwrap_or_default();
+        let prev_signed = position.size.raw();
+        let prev_abs = prev_signed.unsigned_abs() as i64;
+        let prev_entry = position.entry_price.raw();
+        let prev_margin = position.margin_locked;
+
+        let abs_contribution = contribution_signed.unsigned_abs() as i64;
+        let closed_size = prev_abs;
+        let opened_size = abs_contribution - closed_size;
+        let new_signed = contribution_signed.signum() * opened_size;
+
+        // Realized PnL on closed portion (full close of prev) at fill price.
+        let pnl_per_unit_i128 = if prev_signed > 0 {
+            trade.price.raw() as i128 - prev_entry as i128
+        } else {
+            prev_entry as i128 - trade.price.raw() as i128
+        };
+        let pnl_i128 =
+            pnl_per_unit_i128 * (closed_size as i128) / (spec.base_minor_per_major as i128);
+        let realized_pnl = pnl_i128 as i64;
+
+        // Margin required for the new (opened) portion at fill price.
+        let opened_notional = Amount::from_scaled_i128(
+            (trade.price.raw() as i128) * (opened_size as i128),
+            spec.base_minor_per_major as i128,
+        )
+        .ok_or(RejectReason::ArithmeticOverflow)?;
+        let new_margin = opened_notional
+            .mul_bps_ceil(imr_bps)
+            .ok_or(RejectReason::ArithmeticOverflow)?;
+
+        // Hold drawdown for this fill's combined (margin + fee) need.
+        acct.sub_from_hold(hold.currency, reserved_total_for_fill);
+        let target = new_margin
+            .checked_add(actual_fee)
+            .ok_or(RejectReason::ArithmeticOverflow)?;
+        if reserved_total_for_fill.raw() >= target.raw() {
+            let slack = reserved_total_for_fill.raw() - target.raw();
+            if slack > 0 {
+                acct.credit_free(hold.currency, Amount(slack));
+            }
+        } else {
+            let shortfall = target.raw() - reserved_total_for_fill.raw();
+            if !acct.debit_free(hold.currency, Amount(shortfall)) {
+                return Err(RejectReason::InsufficientMargin);
+            }
+        }
+
+        // Release prev margin and apply PnL (signed). PnL can be negative.
+        let net_to_balance = prev_margin.raw() + realized_pnl;
+        let quote_bal = acct.balances.entry(hold.currency).or_insert(Amount::ZERO);
+        *quote_bal = Amount(quote_bal.raw() + net_to_balance);
+
+        // Set up new position with the opened remainder at fill_price.
+        let position = acct.position_mut_or_insert(hold.symbol_id);
+        position.size = Size(new_signed);
+        position.entry_price = trade.price;
+        position.margin_locked = new_margin;
+        position.margin_currency = hold.currency;
+
+        let revenue = self
+            .accounts
+            .get_mut(&EXCHANGE_ACCOUNT)
+            .expect("exchange account missing");
+        revenue.credit_free(spec.quote_currency, actual_fee);
+        Ok(())
+    }
+
     /// Settle a fill that reduces (or closes) a user's existing position.
     /// Computes realized PnL at the fill price, releases proportional margin
     /// from the position back to free, and pays the fee from the order's
@@ -788,6 +937,172 @@ impl RiskEngine {
 /// `Price × Size / base_minor_per_major`, fitted into Amount (i64).
 fn quote_amount(price: Price, size: Size, spec: &SymbolSpec) -> Option<Amount> {
     Amount::from_scaled_i128(price.mul_size(size), spec.base_minor_per_major as i128)
+}
+
+// ---- M4.3.b/c: mark-driven liquidation, funding, settle ----
+
+impl RiskEngine {
+    /// Scan all open positions on `spec.symbol_id`. For each position whose
+    /// (margin_locked + unrealized_pnl_at_mark) < MMR × notional_at_mark,
+    /// force-close at `mark` and return a report.
+    pub fn scan_liquidations(
+        &mut self,
+        spec: &SymbolSpec,
+        mark: Price,
+    ) -> Vec<LiquidationReport> {
+        let mmr_bps = match &spec.kind_params {
+            SymbolKindParams::PerpetualSwap(p) => p.maintenance_margin_bps,
+            SymbolKindParams::Future(f) => f.maintenance_margin_bps,
+            SymbolKindParams::Spot => return Vec::new(),
+        };
+
+        let users: Vec<UserId> = self.accounts.keys().copied().collect();
+        let mut reports = Vec::new();
+        for user_id in users {
+            if user_id == EXCHANGE_ACCOUNT {
+                continue;
+            }
+            let underwater = {
+                let acct = self.accounts.get(&user_id).unwrap();
+                let Some(position) = acct.positions.get(&spec.symbol_id) else {
+                    continue;
+                };
+                if position.size.is_zero() {
+                    continue;
+                }
+                let abs_size = position.size.raw().unsigned_abs() as i128;
+                let notional = (mark.raw() as i128) * abs_size / (spec.base_minor_per_major as i128);
+                let pnl_per_unit = if position.size.raw() > 0 {
+                    mark.raw() as i128 - position.entry_price.raw() as i128
+                } else {
+                    position.entry_price.raw() as i128 - mark.raw() as i128
+                };
+                let unrealized = pnl_per_unit * abs_size / (spec.base_minor_per_major as i128);
+                let equity = position.margin_locked.raw() as i128 + unrealized;
+                let mmr = notional * (mmr_bps.raw() as i128) / 10_000;
+                equity < mmr
+            };
+            if underwater {
+                if let Some(report) = self.force_close_position(user_id, spec, mark) {
+                    reports.push(report);
+                }
+            }
+        }
+        reports
+    }
+
+    /// Internal force-close: realize PnL at `close_price`, release margin to
+    /// free, reset position to flat. Used by liquidation and futures expiry.
+    fn force_close_position(
+        &mut self,
+        user_id: UserId,
+        spec: &SymbolSpec,
+        close_price: Price,
+    ) -> Option<LiquidationReport> {
+        let acct = self.accounts.get_mut(&user_id)?;
+        let position = acct.positions.get(&spec.symbol_id).cloned()?;
+        if position.size.is_zero() {
+            return None;
+        }
+
+        let size = position.size.raw();
+        let abs_size = size.unsigned_abs() as i64;
+        let entry = position.entry_price.raw();
+
+        let pnl_per_unit = if size > 0 {
+            close_price.raw() as i128 - entry as i128
+        } else {
+            entry as i128 - close_price.raw() as i128
+        };
+        let pnl_total = pnl_per_unit * (abs_size as i128) / (spec.base_minor_per_major as i128);
+        let pnl = pnl_total as i64;
+
+        let released_margin = position.margin_locked.raw();
+
+        // Apply: release margin + realize PnL into free balance (may go negative).
+        let quote_bal = acct.balances.entry(spec.quote_currency).or_insert(Amount::ZERO);
+        *quote_bal = Amount(quote_bal.raw() + released_margin + pnl);
+
+        // Reset position.
+        let position_mut = acct.position_mut_or_insert(spec.symbol_id);
+        position_mut.size = Size(0);
+        position_mut.entry_price = Price(0);
+        position_mut.margin_locked = Amount(0);
+
+        Some(LiquidationReport {
+            user_id,
+            symbol_id: spec.symbol_id,
+            size_closed: Size(abs_size),
+            close_price,
+            realized_pnl: Amount(pnl),
+            margin_released: Amount(released_margin),
+        })
+    }
+
+    /// Apply a funding rate to every open position on `spec.symbol_id` at the
+    /// current `mark` price. Returns per-user reports. Long pays short when
+    /// `rate_bps > 0`. Funding flows are user-to-user; the engine takes no
+    /// fee on funding.
+    pub fn apply_funding(
+        &mut self,
+        spec: &SymbolSpec,
+        mark: Price,
+        rate_bps: i32,
+    ) -> Vec<FundingReport> {
+        let users: Vec<UserId> = self.accounts.keys().copied().collect();
+        let mut reports = Vec::new();
+        for user_id in users {
+            if user_id == EXCHANGE_ACCOUNT {
+                continue;
+            }
+            let payment = {
+                let Some(acct) = self.accounts.get(&user_id) else { continue; };
+                let Some(position) = acct.positions.get(&spec.symbol_id) else { continue; };
+                if position.size.is_zero() {
+                    continue;
+                }
+                // payment = signed_size × mark × rate_bps / scale / 10_000
+                let signed_size = position.size.raw() as i128;
+                let raw = signed_size * (mark.raw() as i128) * (rate_bps as i128)
+                    / (spec.base_minor_per_major as i128)
+                    / 10_000;
+                raw as i64
+            };
+            if payment == 0 {
+                continue;
+            }
+            let acct = self.accounts.get_mut(&user_id).expect("user just observed");
+            let quote_bal = acct.balances.entry(spec.quote_currency).or_insert(Amount::ZERO);
+            *quote_bal = Amount(quote_bal.raw() - payment);
+            reports.push(FundingReport {
+                user_id,
+                symbol_id: spec.symbol_id,
+                payment: Amount(payment),
+            });
+        }
+        reports
+    }
+
+    /// Force-close every open position on `spec.symbol_id` at the given
+    /// settlement price. Used by futures expiry. Returns reports analogous
+    /// to liquidations.
+    pub fn settle_all_positions(
+        &mut self,
+        spec: &SymbolSpec,
+        settlement_price: Price,
+    ) -> Vec<LiquidationReport> {
+        let users: Vec<UserId> = self.accounts.keys().copied().collect();
+        let mut reports = Vec::new();
+        for user_id in users {
+            if user_id == EXCHANGE_ACCOUNT {
+                continue;
+            }
+            if let Some(report) = self.force_close_position(user_id, spec, settlement_price) {
+                reports.push(report);
+            }
+        }
+        reports
+    }
 }
 
 #[cfg(test)]
@@ -1009,50 +1324,82 @@ mod tests {
     }
 
     #[test]
-    fn derivative_flip_rejected_but_reduce_accepted() {
+    fn derivative_flip_closes_then_opens_opposite() {
         let mut r = RiskEngine::new();
         let spec = spec_btc_perp();
-        r.add_user(UserId(1)).unwrap();
-        r.add_user(UserId(99)).unwrap();
-        deposit(&mut r, 1, CurrencyId(2), 10_000_000_000);
-        deposit(&mut r, 99, CurrencyId(2), 10_000_000_000);
+        open_50m_long_at_50(&mut r, &spec);
 
-        // Open long size 50M.
-        r.pre_check_place(&po(1, SymbolId(2), Side::Bid, 50_000_000, 50_000_000), &spec, OrderId(1))
+        // Flip: ask 80M at price 55e6 → close 50M long + open 30M short.
+        r.add_user(UserId(3)).unwrap();
+        deposit(&mut r, 3, CurrencyId(2), 10_000_000_000);
+        r.pre_check_place(&po(1, SymbolId(2), Side::Ask, 55_000_000, 80_000_000), &spec, OrderId(3))
             .unwrap();
-        r.pre_check_place(&po(99, SymbolId(2), Side::Ask, 50_000_000, 50_000_000), &spec, OrderId(99))
+        r.pre_check_place(&po(3, SymbolId(2), Side::Bid, 55_000_000, 80_000_000), &spec, OrderId(4))
             .unwrap();
         r.apply_trade(
             &Trade {
                 symbol_id: SymbolId(2),
-                price: Price(50_000_000),
-                size: Size(50_000_000),
-                taker_order_id: OrderId(1),
+                price: Price(55_000_000),
+                size: Size(80_000_000),
+                taker_order_id: OrderId(3),
                 taker_user_id: UserId(1),
-                maker_order_id: OrderId(99),
-                maker_user_id: UserId(99),
-                taker_side: Side::Bid,
+                maker_order_id: OrderId(4),
+                maker_user_id: UserId(3),
+                taker_side: Side::Ask,
                 timestamp: Timestamp(0),
             },
             &spec,
         )
         .unwrap();
 
-        // Reduce by 10M — same side as Ask, opposite of long position → OK.
-        r.pre_check_place(&po(1, SymbolId(2), Side::Ask, 51_000_000, 10_000_000), &spec, OrderId(2))
-            .unwrap();
+        let pos = r.account(UserId(1)).unwrap().position(SymbolId(2)).unwrap();
+        // Long 50M closes at +5M profit; new position is short 30M with entry at 55e6.
+        assert_eq!(pos.size, Size(-30_000_000));
+        assert_eq!(pos.entry_price, Price(55_000_000));
+        // New margin = 30M × 55e6 × 5% / 1e8 = 825_000
+        assert_eq!(pos.margin_locked, Amount(825_000));
+    }
 
-        // Flip attempt: 60M Ask on a 50M long (40M remaining after reduce).
-        // Current after reduce-hold: position still 50M long, free-margin reduced.
-        // Order size 60M > 50M current → flip → REJECT.
-        let err = r
-            .pre_check_place(
-                &po(1, SymbolId(2), Side::Ask, 51_000_000, 60_000_000),
-                &spec,
-                OrderId(3),
-            )
-            .unwrap_err();
-        assert_eq!(err, RejectReason::UnsupportedCommand);
+    #[test]
+    fn derivative_flip_conserves_with_marks() {
+        let mut r = RiskEngine::new();
+        let spec = spec_btc_perp();
+        open_50m_long_at_50(&mut r, &spec);
+
+        r.add_user(UserId(3)).unwrap();
+        deposit(&mut r, 3, CurrencyId(2), 10_000_000_000);
+
+        let mark = |sid: SymbolId| {
+            if sid == SymbolId(2) {
+                Some((Price(55_000_000), 100_000_000))
+            } else {
+                None
+            }
+        };
+        let total_before = r.total_internal_with_marks(CurrencyId(2), mark);
+
+        r.pre_check_place(&po(1, SymbolId(2), Side::Ask, 55_000_000, 80_000_000), &spec, OrderId(3))
+            .unwrap();
+        r.pre_check_place(&po(3, SymbolId(2), Side::Bid, 55_000_000, 80_000_000), &spec, OrderId(4))
+            .unwrap();
+        r.apply_trade(
+            &Trade {
+                symbol_id: SymbolId(2),
+                price: Price(55_000_000),
+                size: Size(80_000_000),
+                taker_order_id: OrderId(3),
+                taker_user_id: UserId(1),
+                maker_order_id: OrderId(4),
+                maker_user_id: UserId(3),
+                taker_side: Side::Ask,
+                timestamp: Timestamp(0),
+            },
+            &spec,
+        )
+        .unwrap();
+
+        let total_after = r.total_internal_with_marks(CurrencyId(2), mark);
+        assert_eq!(total_before, total_after);
     }
 
     #[test]

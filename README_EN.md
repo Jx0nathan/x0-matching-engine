@@ -4,7 +4,7 @@ English | [中文](./README.md)
 
 Production-targeted matching engine for spot + perpetual/futures, written in Rust.
 
-> **Status: M4.2 (derivatives - close/reduce + realized PnL) complete.** Derivative orders can now reduce or fully close existing positions; PnL realizes at the fill price and credits/debits free balance. Conservation is enforced via mark-to-market (`total_internal_with_marks`): at any fixed mark, the total stays invariant across every trade. M4.3 adds flip-in-one-order, liquidation, and funding. See `CLAUDE.md`.
+> **Status: M4 complete — derivatives end-to-end.** Open, increase, reduce, close, and flip-in-one-fill all work; `SetMarkPrice` triggers liquidation; `ApplyFunding` redistributes between longs/shorts; `SettleFuture` force-closes all positions and suspends the symbol. Mark-aware conservation holds within ±2 units per op (integer-truncation floor; not a fund leak). M5 (productionization) is next.
 
 ## Design goals
 

@@ -16,7 +16,38 @@ pub enum Command {
     /// Register a new tradable symbol. Routed through the WAL so a restored
     /// engine reconstructs its symbol set without out-of-band config replay.
     RegisterSymbol(SymbolSpec),
+    /// Update the engine's mark price for a derivative symbol. Triggers a
+    /// liquidation sweep — positions whose margin ratio falls below MMR are
+    /// force-closed at the new mark.
+    SetMarkPrice(SetMarkPrice),
+    /// Apply a perpetual funding settlement. Positive `rate_bps` → longs pay
+    /// shorts; negative → shorts pay longs. Funding charge per position is
+    /// `signed_size × mark × rate / scale / 10_000`.
+    ApplyFunding(ApplyFunding),
+    /// Settle and expire a futures symbol: force-close every open position
+    /// on `symbol_id` at `settlement_price`, then suspend the symbol so no
+    /// new orders are accepted.
+    SettleFuture(SettleFuture),
     Nop,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetMarkPrice {
+    pub symbol_id: SymbolId,
+    pub mark_price: Price,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyFunding {
+    pub symbol_id: SymbolId,
+    /// Funding rate in basis points (signed: +100 = longs pay shorts 1%).
+    pub rate_bps: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettleFuture {
+    pub symbol_id: SymbolId,
+    pub settlement_price: Price,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

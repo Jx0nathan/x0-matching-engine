@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c31518f25165fa1c65030da30f7957982f05a1d9d67942adbeed85575353366a # shrinks to ops = [PerpPlace { uid: 2, side: false, price: 40134649, size: 4674411 }, PerpPlace { uid: 3, side: false, price: 42653396, size: 4581873 }, PerpPlace { uid: 1, side: true, price: 40134649, size: 3689710 }, PerpPlace { uid: 2, side: true, price: 42653396, size: 979574 }, PerpPlace { uid: 3, side: true, price: 42653396, size: 3978026 }, PerpPlace { uid: 1, side: false, price: 40000000, size: 100000 }]
+cc 3c7398ab31f1d1d70bbd69f57944e25d637235c67212dd35b0f8f0d4e6691e3d # shrinks to ops = [PerpPlace { uid: 1, side: false, price: 48258264, size: 7179906 }, PerpPlace { uid: 2, side: false, price: 41444622, size: 6509932 }, PerpPlace { uid: 1, side: true, price: 48203100, size: 8830792 }, PerpPlace { uid: 2, side: true, price: 47145346, size: 2970834 }, PerpPlace { uid: 2, side: true, price: 45807269, size: 606189 }, SetMark { price: 40381908 }, PerpPlace { uid: 1, side: true, price: 46169203, size: 3028328 }, PerpPlace { uid: 2, side: false, price: 40000000, size: 7262849 }, SetMark { price: 46706478 }, PerpPlace { uid: 2, side: true, price: 48258264, size: 1204475 }, PerpPlace { uid: 1, side: true, price: 48258264, size: 2335665 }, PerpPlace { uid: 2, side: false, price: 45706435, size: 4090041 }]
