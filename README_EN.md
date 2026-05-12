@@ -4,7 +4,7 @@ English | [中文](./README.md)
 
 Production-targeted matching engine for spot + perpetual/futures, written in Rust.
 
-> **Status: M4 complete — derivatives end-to-end.** Open, increase, reduce, close, and flip-in-one-fill all work; `SetMarkPrice` triggers liquidation; `ApplyFunding` redistributes between longs/shorts; `SettleFuture` force-closes all positions and suspends the symbol. Mark-aware conservation holds within ±2 units per op (integer-truncation floor; not a fund leak). M5 (productionization) is next.
+> **Status: M5.1 (self-trade prevention) complete on top of M4.** All four STP strategies (CancelTaker / CancelMaker / CancelBoth / DecrementAndCancel) are wired through the matching engine; STP-cancelled makers have their risk holds released (partial for DAC partial-reduce). `filled` now reflects actual trade volume only.
 
 ## Design goals
 

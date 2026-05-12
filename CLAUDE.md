@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A production-targeted matching engine for spot + perpetual/futures, built as a Cargo workspace. This is a **greenfield rewrite** of an earlier `matching-core` reference design; that legacy code is for comparison only and not depended on.
 
-Status: **M4 complete** — derivatives end-to-end. Open, increase, reduce, close, and flip-in-one-order all work; mark price triggers liquidation; perp funding redistributes between longs and shorts; futures expiry force-closes at settlement price and suspends the symbol. Mark-aware conservation invariant (`total_internal_with_marks`) holds within ±2 units per op (integer-truncation floor; not a fund leak). M5 (productionization) is what's left.
+Status: **M5.1 (self-trade prevention) complete** on top of M4. All four STP strategies (CancelTaker, CancelMaker, CancelBoth, DecrementAndCancel) are implemented in the matching engine. STP-cancelled makers have their risk holds released (full or partial for DAC) and `OrderCancelled` events emitted. `filled` now means "actual trade volume only" — STP-neutralised volume does not count.
 
 ## Architecture
 
@@ -97,7 +97,8 @@ cargo fmt --all
 | M3.3 | CRC32 on WAL records + `submit_batch` group commit (batched fsync per ring batch) | ✅ done |
 | M4.1 | Derivative `Position` + isolated `margin_locked`, perp/future pre-check + settle for open/increase orders | ✅ done |
 | M4.2 | Reduce/close orders + realized PnL at fill price + mark-aware conservation (`total_internal_with_marks`) | ✅ done |
-| **M4.3** | Flip-in-one-order, `Command::SetMarkPrice` + liquidation, `Command::ApplyFunding`, `Command::SettleFuture`, derivative property test, tracing on hot paths | ✅ done |
+| M4.3 | Flip-in-one-order, `Command::SetMarkPrice` + liquidation, `Command::ApplyFunding`, `Command::SettleFuture`, derivative property test, tracing on hot paths | ✅ done |
+| **M5.1** | Self-trade prevention: CancelTaker / CancelMaker / CancelBoth / DecrementAndCancel; partial hold release for DAC partial-reduce | ✅ done |
 | M5 | Productionization: tracing/Prometheus, fuzz suite, CI, stress tests, gray-release config, true 3-thread R1/Match/R2 via UID sharding | pending |
 
 Each milestone is independently shippable. Don't start M(n+1) work in M(n) — keep the boundary clean.

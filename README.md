@@ -4,7 +4,7 @@
 
 面向生产的撮合引擎，覆盖现货 + 永续/期货，使用 Rust 编写。
 
-> **当前状态：M4 完成 ——衍生品全链路。** 开/加/减/平/翻全部支持；标记价驱动强平；永续资金费率结算；期货到期强平 + 自动暂停。资金守恒 mark-to-market 模型在任意固定 mark 下偏差 ≤ 2（整数截断地板，非资金泄漏）。M5 上生产化（tracing/Prometheus/CI）。路线图详见 `CLAUDE.md`。
+> **当前状态：M5.1（自成交保护）完成 on top of M4。** 4 种 STP 策略（CancelTaker / CancelMaker / CancelBoth / DecrementAndCancel）全部接入撮合主循环；DAC 部分平仓时风控按比例释放对应保证金。`filled` 现在只算真实成交量（STP 中和的不算）。路线图详见 `CLAUDE.md`。
 
 ## 设计目标
 

@@ -377,6 +377,7 @@ impl MatchingEngine {
             price: p.price.expect("price required, validated by pre_check"),
             size: p.size,
             timestamp: now,
+            stp: p.self_trade_prevention,
         });
 
         if let Some(reason) = outcome.reject {
@@ -389,6 +390,21 @@ impl MatchingEngine {
                 .risk
                 .apply_trade(trade, &spec)
                 .expect("apply_trade should not fail in a consistent state");
+        }
+
+        // Release holds for any maker cancelled by self-trade prevention.
+        // Full-cancel: release entire remaining hold and drop the Hold record.
+        // Partial (DecrementAndCancel maker > taker): release the proportional
+        // portion of the hold; the maker stays on the book with reduced size.
+        for stp_cancel in &outcome.stp_cancellations {
+            if stp_cancel.full_cancel {
+                let _ = self.state.risk.release_hold(stp_cancel.order_id);
+            } else {
+                let _ = self
+                    .state
+                    .risk
+                    .partial_release_hold(stp_cancel.order_id, stp_cancel.size_cancelled);
+            }
         }
 
         if !outcome.rested {
@@ -405,6 +421,19 @@ impl MatchingEngine {
         }));
         for trade in outcome.trades.iter().cloned() {
             events.push(Event::Trade(trade));
+        }
+        // Emit an OrderCancelled event per STP-affected maker (full cancels
+        // only — partial reduces are state changes, not lifecycle events).
+        for stp_cancel in &outcome.stp_cancellations {
+            if stp_cancel.full_cancel {
+                events.push(Event::OrderCancelled(OrderCancelled {
+                    order_id: stp_cancel.order_id,
+                    user_id: stp_cancel.user_id,
+                    symbol_id: p.symbol_id,
+                    remaining_size: stp_cancel.size_cancelled,
+                    timestamp: now,
+                }));
+            }
         }
 
         let status = if outcome.filled == p.size {

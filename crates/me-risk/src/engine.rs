@@ -449,6 +449,43 @@ impl RiskEngine {
         Ok(())
     }
 
+    /// Release a portion of an order's hold corresponding to `size_to_release`
+    /// of the order's remaining size. Used by STP `DecrementAndCancel` when a
+    /// maker's order is partially reduced — its remaining hold shrinks
+    /// proportionally and the freed amount moves back to free balance. The
+    /// Hold record stays in the engine (with reduced `remaining_size` and
+    /// `remaining_amount`) since the maker is still on the book.
+    pub fn partial_release_hold(
+        &mut self,
+        order_id: OrderId,
+        size_to_release: Size,
+    ) -> Result<(), RejectReason> {
+        let Some(hold) = self.holds.get_mut(&order_id) else {
+            return Ok(());
+        };
+        if size_to_release.raw() <= 0 || hold.remaining_size.raw() <= 0 {
+            return Ok(());
+        }
+        // Cap release to what the hold actually still has.
+        let release_size = size_to_release.raw().min(hold.remaining_size.raw());
+        let release_amount = (hold.remaining_amount.raw() as i128) * (release_size as i128)
+            / (hold.remaining_size.raw() as i128);
+        let release_amount = release_amount as i64;
+
+        hold.remaining_size = Size(hold.remaining_size.raw() - release_size);
+        hold.remaining_amount = Amount(hold.remaining_amount.raw() - release_amount);
+
+        let user_id = hold.user_id;
+        let currency = hold.currency;
+        let acct = self
+            .accounts
+            .get_mut(&user_id)
+            .ok_or(RejectReason::UnknownUser)?;
+        acct.sub_from_hold(currency, Amount(release_amount));
+        acct.credit_free(currency, Amount(release_amount));
+        Ok(())
+    }
+
     fn settle_side(
         &mut self,
         trade: &Trade,
