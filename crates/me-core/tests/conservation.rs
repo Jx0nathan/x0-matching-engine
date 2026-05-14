@@ -26,7 +26,10 @@ fn build_engine() -> MatchingEngine {
         lot_size: Size(1),
         min_order_size: Size(1),
         max_order_size: Size(i64::MAX),
-        fee_schedule: FeeSchedule { maker_bps: Bps(10), taker_bps: Bps(20) },
+        fee_schedule: FeeSchedule {
+            maker_bps: Bps(10),
+            taker_bps: Bps(20),
+        },
         price_band: PriceBand::none(),
         kind_params: SymbolKindParams::Spot,
         is_suspended: false,
@@ -38,13 +41,31 @@ fn build_engine() -> MatchingEngine {
 #[derive(Debug, Clone)]
 enum Op {
     AddUser(u64),
-    AdjustBalance { uid: u64, cur: u32, delta: i64 },
-    Place { uid: u64, side: Side, price: i64, size: i64, tif: Tif },
-    Cancel { uid: u64, order_id_hint: u64 },
+    AdjustBalance {
+        uid: u64,
+        cur: u32,
+        delta: i64,
+    },
+    Place {
+        uid: u64,
+        side: Side,
+        price: i64,
+        size: i64,
+        tif: Tif,
+    },
+    Cancel {
+        uid: u64,
+        order_id_hint: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
-enum Tif { Gtc, Ioc, Fok, PostOnly }
+enum Tif {
+    Gtc,
+    Ioc,
+    Fok,
+    PostOnly,
+}
 impl Tif {
     fn into(self) -> TimeInForce {
         match self {
@@ -58,7 +79,12 @@ impl Tif {
 
 fn op_strategy() -> impl Strategy<Value = Op> {
     let side = prop_oneof![Just(Side::Bid), Just(Side::Ask)];
-    let tif = prop_oneof![Just(Tif::Gtc), Just(Tif::Ioc), Just(Tif::Fok), Just(Tif::PostOnly)];
+    let tif = prop_oneof![
+        Just(Tif::Gtc),
+        Just(Tif::Ioc),
+        Just(Tif::Fok),
+        Just(Tif::PostOnly)
+    ];
 
     prop_oneof![
         // weight new-user lower than other ops so the sequence has more interesting state
@@ -115,7 +141,9 @@ fn build_command(op: &Op, next_id: &mut u64) -> (Command, Option<(u32, i128)>) {
     *next_id += 1;
     match *op {
         Op::AddUser(uid) => (
-            Command::AddUser(AddUser { user_id: UserId(uid) }),
+            Command::AddUser(AddUser {
+                user_id: UserId(uid),
+            }),
             None,
         ),
         Op::AdjustBalance { uid, cur, delta } => (
@@ -127,7 +155,13 @@ fn build_command(op: &Op, next_id: &mut u64) -> (Command, Option<(u32, i128)>) {
             }),
             Some((cur, delta as i128)),
         ),
-        Op::Place { uid, side, price, size, tif } => (
+        Op::Place {
+            uid,
+            side,
+            price,
+            size,
+            tif,
+        } => (
             Command::PlaceOrder(PlaceOrder {
                 user_id: UserId(uid),
                 symbol_id: SymbolId(1),

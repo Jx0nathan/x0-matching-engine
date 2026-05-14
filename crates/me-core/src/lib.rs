@@ -15,7 +15,9 @@
 //!   No code path drops a Hold silently.
 
 pub mod engine;
+pub mod metrics;
 pub mod pipeline;
 
 pub use engine::*;
+pub use metrics::*;
 pub use pipeline::*;

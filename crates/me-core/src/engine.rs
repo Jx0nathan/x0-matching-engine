@@ -1,10 +1,13 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use ahash::AHashMap;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use tracing::{debug, trace};
+
+use crate::metrics::{render_prometheus, Metrics};
 
 /// Returns true if the mark price has crossed the stop trigger for an order
 /// of the given side. Buy stop (Bid): triggers when mark >= stop. Sell stop
@@ -21,8 +24,8 @@ use me_risk::RiskEngine;
 use me_types::{
     AdjustBalance, ApplyFunding, Command, CommandEnvelope, CommandReceipt, CommandStatus,
     CurrencyId, Event, ModifyOrder, OrderAccepted, OrderCancelled, OrderFilled, OrderId,
-    OrderPartiallyFilled, OrderRejected, OrderType, PlaceOrder, Price, RejectReason, SeqNo,
-    SelfTradePrevention, SetMarkPrice, SettleFuture, Side, Size, SymbolId, SymbolKindParams,
+    OrderPartiallyFilled, OrderRejected, OrderType, PlaceOrder, Price, RejectReason,
+    SelfTradePrevention, SeqNo, SetMarkPrice, SettleFuture, Side, Size, SymbolId, SymbolKindParams,
     SymbolSpec, TimeInForce, Timestamp, UserId,
 };
 use me_wal::{SnapshotStore, WalWriter};
@@ -65,6 +68,7 @@ pub struct MatchingEngine {
     state: EngineSnapshot,
     wal: Option<WalWriter>,
     snapshot_store: Option<SnapshotStore>,
+    metrics: Arc<Metrics>,
 }
 
 impl Default for MatchingEngine {
@@ -88,7 +92,31 @@ impl MatchingEngine {
             },
             wal: None,
             snapshot_store: None,
+            metrics: Arc::new(Metrics::new()),
         }
+    }
+
+    /// Shared instrumentation counters. Clone the `Arc` to give other
+    /// threads (e.g. an HTTP server thread serving `/metrics`) read access
+    /// without locking the engine.
+    pub fn metrics(&self) -> Arc<Metrics> {
+        self.metrics.clone()
+    }
+
+    /// Render counters + on-demand state gauges in Prometheus text format.
+    pub fn metrics_snapshot(&self) -> String {
+        let depths: Vec<(u32, usize)> = self
+            .state
+            .books
+            .iter()
+            .map(|(sid, book)| (sid.0, book.total_resting_orders()))
+            .collect();
+        render_prometheus(
+            &self.metrics,
+            &self.state.risk,
+            self.state.last_applied_seq.0,
+            &depths,
+        )
     }
 
     pub fn mark_price(&self, symbol_id: SymbolId) -> Option<Price> {
@@ -102,7 +130,11 @@ impl MatchingEngine {
     pub fn total_internal_with_marks(&self, currency: CurrencyId) -> i128 {
         self.state.risk.total_internal_with_marks(currency, |sid| {
             let mark = self.state.mark_prices.get(&sid).copied()?;
-            let scale = self.state.symbols.get(&sid).map(|s| s.base_minor_per_major)?;
+            let scale = self
+                .state
+                .symbols
+                .get(&sid)
+                .map(|s| s.base_minor_per_major)?;
             Some((mark, scale))
         })
     }
@@ -123,6 +155,13 @@ impl MatchingEngine {
         eng.wal = Some(wal);
         eng.restore(wal_path.as_ref())?;
         Ok(eng)
+    }
+
+    fn record_receipt(&self, receipt: &CommandReceipt) {
+        self.metrics.inc(&self.metrics.commands_total);
+        if matches!(receipt.status, CommandStatus::Rejected(_)) {
+            self.metrics.inc(&self.metrics.rejected_total);
+        }
     }
 
     fn restore(&mut self, wal_path: &Path) -> Result<()> {
@@ -159,7 +198,9 @@ impl MatchingEngine {
         if self.state.symbols.contains_key(&spec.symbol_id) {
             return CommandReceipt::rejected(seq_no, RejectReason::UnsupportedCommand);
         }
-        self.state.books.insert(spec.symbol_id, SpotOrderBook::new(spec.symbol_id));
+        self.state
+            .books
+            .insert(spec.symbol_id, SpotOrderBook::new(spec.symbol_id));
         self.state.symbols.insert(spec.symbol_id, spec);
         CommandReceipt {
             seq_no,
@@ -186,6 +227,8 @@ impl MatchingEngine {
         if !matches!(spec.kind_params, SymbolKindParams::Spot) {
             let reports = self.state.risk.scan_liquidations(&spec, cmd.mark_price);
             if !reports.is_empty() {
+                self.metrics
+                    .add(&self.metrics.liquidations_total, reports.len() as u64);
                 debug!(
                     symbol_id = cmd.symbol_id.0,
                     liquidations = reports.len(),
@@ -196,6 +239,10 @@ impl MatchingEngine {
 
         // Trigger any pending stops whose condition is satisfied at the new mark.
         let triggered = self.drain_triggered_stops(cmd.symbol_id, cmd.mark_price);
+        if !triggered.is_empty() {
+            self.metrics
+                .add(&self.metrics.stops_triggered_total, triggered.len() as u64);
+        }
         let mut events: SmallVec<[Event; 4]> = SmallVec::new();
         for mut stop in triggered {
             // Lower order_type to Limit; the price/TIF were already set at
@@ -265,12 +312,17 @@ impl MatchingEngine {
         if !matches!(spec.kind_params, SymbolKindParams::Future(_)) {
             return CommandReceipt::rejected(seq_no, RejectReason::UnsupportedCommand);
         }
-        let _reports = self.state.risk.settle_all_positions(&spec, cmd.settlement_price);
+        let _reports = self
+            .state
+            .risk
+            .settle_all_positions(&spec, cmd.settlement_price);
         // Suspend the expired symbol so no new orders are accepted.
         if let Some(s) = self.state.symbols.get_mut(&cmd.symbol_id) {
             s.is_suspended = true;
         }
-        self.state.mark_prices.insert(cmd.symbol_id, cmd.settlement_price);
+        self.state
+            .mark_prices
+            .insert(cmd.symbol_id, cmd.settlement_price);
         CommandReceipt {
             seq_no,
             status: CommandStatus::Accepted,
@@ -311,15 +363,22 @@ impl MatchingEngine {
         let seq_no = SeqNo(self.state.next_seq_no);
         self.state.next_seq_no += 1;
         tracing::Span::current().record("seq_no", seq_no.0);
-        let env = CommandEnvelope { seq_no, received_at: now, command: cmd };
+        let env = CommandEnvelope {
+            seq_no,
+            received_at: now,
+            command: cmd,
+        };
 
         if let Some(wal) = &mut self.wal {
             wal.append(&env).expect("WAL append failed");
             wal.sync().expect("WAL sync failed");
+            self.metrics.inc(&self.metrics.wal_syncs_total);
             trace!(seq = seq_no.0, "WAL synced");
         }
 
-        self.apply_envelope(&env)
+        let receipt = self.apply_envelope(&env);
+        self.record_receipt(&receipt);
+        receipt
     }
 
     /// Batched variant of `submit`: append all envelopes to the WAL, fsync
@@ -329,10 +388,7 @@ impl MatchingEngine {
     /// Durability invariant preserved: by the time any receipt is returned,
     /// every record in the batch is on durable storage.
     #[tracing::instrument(skip_all, fields(batch_size = cmds.len()))]
-    pub fn submit_batch(
-        &mut self,
-        cmds: Vec<(Command, Timestamp)>,
-    ) -> Vec<CommandReceipt> {
+    pub fn submit_batch(&mut self, cmds: Vec<(Command, Timestamp)>) -> Vec<CommandReceipt> {
         if cmds.is_empty() {
             return Vec::new();
         }
@@ -340,7 +396,11 @@ impl MatchingEngine {
         for (cmd, now) in cmds {
             let seq_no = SeqNo(self.state.next_seq_no);
             self.state.next_seq_no += 1;
-            envs.push(CommandEnvelope { seq_no, received_at: now, command: cmd });
+            envs.push(CommandEnvelope {
+                seq_no,
+                received_at: now,
+                command: cmd,
+            });
         }
 
         if let Some(wal) = &mut self.wal {
@@ -348,10 +408,16 @@ impl MatchingEngine {
                 wal.append(env).expect("WAL append failed");
             }
             wal.sync().expect("WAL sync failed");
+            self.metrics.inc(&self.metrics.wal_syncs_total);
             debug!(batch_size = envs.len(), "WAL group-commit synced");
         }
 
-        envs.iter().map(|env| self.apply_envelope(env)).collect()
+        let receipts: Vec<CommandReceipt> =
+            envs.iter().map(|env| self.apply_envelope(env)).collect();
+        for r in &receipts {
+            self.record_receipt(r);
+        }
+        receipts
     }
 
     /// Apply an envelope to engine state. Used both for live submissions
@@ -396,15 +462,28 @@ impl MatchingEngine {
                 },
                 Err(r) => CommandReceipt::rejected(seq_no, r),
             },
-            Command::PlaceOrder(p) => self.handle_place(seq_no, p.clone(), now),
+            Command::PlaceOrder(p) => {
+                self.metrics.inc(&self.metrics.place_orders_total);
+                self.handle_place(seq_no, p.clone(), now)
+            }
             Command::CancelOrder(c) => {
+                self.metrics.inc(&self.metrics.cancel_orders_total);
                 self.handle_cancel(seq_no, c.user_id, c.symbol_id, c.order_id, now)
             }
             Command::RegisterSymbol(spec) => self.handle_register_symbol(seq_no, spec.clone()),
             Command::SetMarkPrice(m) => self.handle_set_mark_price(seq_no, m.clone(), now),
-            Command::ApplyFunding(f) => self.handle_apply_funding(seq_no, f.clone()),
-            Command::SettleFuture(s) => self.handle_settle_future(seq_no, s.clone()),
-            Command::ModifyOrder(m) => self.handle_modify(seq_no, m.clone(), now),
+            Command::ApplyFunding(f) => {
+                self.metrics.inc(&self.metrics.funding_settlements_total);
+                self.handle_apply_funding(seq_no, f.clone())
+            }
+            Command::SettleFuture(s) => {
+                self.metrics.inc(&self.metrics.future_settlements_total);
+                self.handle_settle_future(seq_no, s.clone())
+            }
+            Command::ModifyOrder(m) => {
+                self.metrics.inc(&self.metrics.modify_orders_total);
+                self.handle_modify(seq_no, m.clone(), now)
+            }
         };
 
         self.state.last_applied_seq = seq_no;
@@ -437,10 +516,7 @@ impl MatchingEngine {
         // (or price if reserve is omitted). Ask side accepts any positive
         // bid, so the floor drops to 0. Time-in-force is forced to Ioc so
         // the Market portion never rests.
-        let is_market_like = matches!(
-            p.order_type,
-            OrderType::Market | OrderType::StopMarket
-        );
+        let is_market_like = matches!(p.order_type, OrderType::Market | OrderType::StopMarket);
         if is_market_like {
             match p.side {
                 Side::Bid => {
@@ -511,7 +587,11 @@ impl MatchingEngine {
         }
 
         let (status, events) = self.apply_to_book(order_id, &p, &spec, now);
-        CommandReceipt { seq_no, status, events }
+        CommandReceipt {
+            seq_no,
+            status,
+            events,
+        }
     }
 
     /// Run book.place + settlement for an order that already has a registered
@@ -565,6 +645,8 @@ impl MatchingEngine {
                 .apply_trade(trade, spec)
                 .expect("apply_trade should not fail in a consistent state");
         }
+        self.metrics
+            .add(&self.metrics.trades_total, outcome.trades.len() as u64);
 
         for stp_cancel in &outcome.stp_cancellations {
             if stp_cancel.full_cancel {
@@ -576,6 +658,10 @@ impl MatchingEngine {
                     .partial_release_hold(stp_cancel.order_id, stp_cancel.size_cancelled);
             }
         }
+        self.metrics.add(
+            &self.metrics.stp_cancellations_total,
+            outcome.stp_cancellations.len() as u64,
+        );
 
         if !outcome.rested {
             let _ = self.state.risk.release_hold(order_id);
@@ -647,12 +733,7 @@ impl MatchingEngine {
     /// synthetic replacement runs the normal pre_check + apply_to_book path.
     /// Time priority is lost — that's the trade-off for not building a
     /// preserving-amend code path (which only works in narrow cases).
-    fn handle_modify(
-        &mut self,
-        seq_no: SeqNo,
-        cmd: ModifyOrder,
-        now: Timestamp,
-    ) -> CommandReceipt {
+    fn handle_modify(&mut self, seq_no: SeqNo, cmd: ModifyOrder, now: Timestamp) -> CommandReceipt {
         // Snapshot the existing order (cloned so we can drop the borrow before
         // mutating the book on the cancel/replace below).
         let existing = {
@@ -670,16 +751,23 @@ impl MatchingEngine {
 
         let new_price = cmd.new_price.unwrap_or(existing.price);
         // For iceberg orders the "remaining order" is visible + hidden.
-        let current_total =
-            existing.size_remaining.raw() + existing.hidden_remaining.raw();
+        let current_total = existing.size_remaining.raw() + existing.hidden_remaining.raw();
         let new_size = cmd.new_size.unwrap_or(Size(current_total));
         if !new_size.is_positive() {
             return CommandReceipt::rejected(seq_no, RejectReason::SizeBelowMinimum);
         }
 
         let is_iceberg = existing.visible_slice.raw() > 0;
-        let order_type = if is_iceberg { OrderType::Iceberg } else { OrderType::Limit };
-        let visible_size = if is_iceberg { Some(existing.visible_slice) } else { None };
+        let order_type = if is_iceberg {
+            OrderType::Iceberg
+        } else {
+            OrderType::Limit
+        };
+        let visible_size = if is_iceberg {
+            Some(existing.visible_slice)
+        } else {
+            None
+        };
 
         let new_place = PlaceOrder {
             user_id: cmd.user_id,
@@ -710,14 +798,19 @@ impl MatchingEngine {
                 .books
                 .get_mut(&cmd.symbol_id)
                 .expect("symbol registered");
-            book.cancel(cmd.order_id).expect("just verified by get_order")
+            book.cancel(cmd.order_id)
+                .expect("just verified by get_order")
         };
         let _ = self.state.risk.release_hold(cmd.order_id);
 
         // Pre-check the replacement. If pre-check rejects (e.g. user can't
         // cover the increased size), the old order is already cancelled and
         // its hold returned to free — the user is now flat on this order_id.
-        if let Err(r) = self.state.risk.pre_check_place(&new_place, &spec, new_order_id) {
+        if let Err(r) = self
+            .state
+            .risk
+            .pre_check_place(&new_place, &spec, new_order_id)
+        {
             let mut events: SmallVec<[Event; 4]> = SmallVec::new();
             events.push(Event::OrderCancelled(OrderCancelled {
                 order_id: cmd.order_id,
@@ -753,7 +846,11 @@ impl MatchingEngine {
         for ev in new_events.drain(..) {
             events.push(ev);
         }
-        CommandReceipt { seq_no, status, events }
+        CommandReceipt {
+            seq_no,
+            status,
+            events,
+        }
     }
 
     fn handle_cancel(
@@ -834,7 +931,10 @@ mod tests {
             lot_size: Size(1),
             min_order_size: Size(1),
             max_order_size: Size(i64::MAX),
-            fee_schedule: FeeSchedule { maker_bps: Bps(10), taker_bps: Bps(20) },
+            fee_schedule: FeeSchedule {
+                maker_bps: Bps(10),
+                taker_bps: Bps(20),
+            },
             price_band: PriceBand::none(),
             kind_params: SymbolKindParams::Spot,
             is_suspended: false,
@@ -844,7 +944,12 @@ mod tests {
     }
 
     fn add_user(eng: &mut MatchingEngine, uid: u64) {
-        eng.submit(Command::AddUser(AddUser { user_id: UserId(uid) }), Timestamp(0));
+        eng.submit(
+            Command::AddUser(AddUser {
+                user_id: UserId(uid),
+            }),
+            Timestamp(0),
+        );
     }
 
     fn deposit(eng: &mut MatchingEngine, uid: u64, currency: u32, amt: i64) {
@@ -898,8 +1003,24 @@ mod tests {
         let btc_before = eng.risk().total_internal(CurrencyId(1));
         let usdt_before = eng.risk().total_internal(CurrencyId(2));
 
-        place(&mut eng, 1, 1, Side::Ask, 50_000_000, 100_000_000, TimeInForce::Gtc);
-        let r = place(&mut eng, 2, 2, Side::Bid, 50_000_000, 100_000_000, TimeInForce::Ioc);
+        place(
+            &mut eng,
+            1,
+            1,
+            Side::Ask,
+            50_000_000,
+            100_000_000,
+            TimeInForce::Gtc,
+        );
+        let r = place(
+            &mut eng,
+            2,
+            2,
+            Side::Bid,
+            50_000_000,
+            100_000_000,
+            TimeInForce::Ioc,
+        );
         assert_eq!(r.status, CommandStatus::Filled);
 
         assert_eq!(eng.risk().total_internal(CurrencyId(1)), btc_before);
@@ -914,12 +1035,26 @@ mod tests {
         let usdt_before = eng.risk().total_internal(CurrencyId(2));
         let user_free_before = eng.risk().account(UserId(1)).unwrap().free(CurrencyId(2));
 
-        let r = place(&mut eng, 1, 1, Side::Bid, 50_000_000, 100_000_000, TimeInForce::Fok);
+        let r = place(
+            &mut eng,
+            1,
+            1,
+            Side::Bid,
+            50_000_000,
+            100_000_000,
+            TimeInForce::Fok,
+        );
         assert!(matches!(r.status, CommandStatus::Rejected(_)));
 
         assert_eq!(eng.risk().total_internal(CurrencyId(2)), usdt_before);
-        assert_eq!(eng.risk().account(UserId(1)).unwrap().free(CurrencyId(2)), user_free_before);
-        assert_eq!(eng.risk().account(UserId(1)).unwrap().held(CurrencyId(2)), Amount::ZERO);
+        assert_eq!(
+            eng.risk().account(UserId(1)).unwrap().free(CurrencyId(2)),
+            user_free_before
+        );
+        assert_eq!(
+            eng.risk().account(UserId(1)).unwrap().held(CurrencyId(2)),
+            Amount::ZERO
+        );
     }
 
     #[test]
@@ -929,7 +1064,15 @@ mod tests {
         deposit(&mut eng, 1, 2, 1_000_000_000);
         let free_before = eng.risk().account(UserId(1)).unwrap().free(CurrencyId(2));
 
-        let r = place(&mut eng, 1, 1, Side::Bid, 50_000_000, 100_000_000, TimeInForce::Gtc);
+        let r = place(
+            &mut eng,
+            1,
+            1,
+            Side::Bid,
+            50_000_000,
+            100_000_000,
+            TimeInForce::Gtc,
+        );
         assert_eq!(r.status, CommandStatus::Accepted);
         let order_id = match &r.events[0] {
             Event::OrderAccepted(a) => a.order_id,
@@ -945,8 +1088,14 @@ mod tests {
             Timestamp(0),
         );
 
-        assert_eq!(eng.risk().account(UserId(1)).unwrap().free(CurrencyId(2)), free_before);
-        assert_eq!(eng.risk().account(UserId(1)).unwrap().held(CurrencyId(2)), Amount::ZERO);
+        assert_eq!(
+            eng.risk().account(UserId(1)).unwrap().free(CurrencyId(2)),
+            free_before
+        );
+        assert_eq!(
+            eng.risk().account(UserId(1)).unwrap().held(CurrencyId(2)),
+            Amount::ZERO
+        );
     }
 
     #[test]
@@ -959,13 +1108,32 @@ mod tests {
         let usdt_before = eng.risk().total_internal(CurrencyId(2));
         let btc_before = eng.risk().total_internal(CurrencyId(1));
 
-        place(&mut eng, 1, 1, Side::Ask, 50_000_000, 30_000_000, TimeInForce::Gtc);
-        let r = place(&mut eng, 2, 2, Side::Bid, 50_000_000, 100_000_000, TimeInForce::Ioc);
+        place(
+            &mut eng,
+            1,
+            1,
+            Side::Ask,
+            50_000_000,
+            30_000_000,
+            TimeInForce::Gtc,
+        );
+        let r = place(
+            &mut eng,
+            2,
+            2,
+            Side::Bid,
+            50_000_000,
+            100_000_000,
+            TimeInForce::Ioc,
+        );
         assert!(matches!(r.status, CommandStatus::PartiallyFilled));
 
         assert_eq!(eng.risk().total_internal(CurrencyId(1)), btc_before);
         assert_eq!(eng.risk().total_internal(CurrencyId(2)), usdt_before);
-        assert_eq!(eng.risk().account(UserId(2)).unwrap().held(CurrencyId(2)), Amount::ZERO);
+        assert_eq!(
+            eng.risk().account(UserId(2)).unwrap().held(CurrencyId(2)),
+            Amount::ZERO
+        );
     }
 
     #[test]
@@ -973,15 +1141,69 @@ mod tests {
         let mut eng = MatchingEngine::new();
         add_user(&mut eng, 1);
         let r = place(&mut eng, 1, 1, Side::Bid, 100, 10, TimeInForce::Gtc);
-        assert!(matches!(r.status, CommandStatus::Rejected(RejectReason::UnknownSymbol)));
+        assert!(matches!(
+            r.status,
+            CommandStatus::Rejected(RejectReason::UnknownSymbol)
+        ));
     }
 
     #[test]
     fn insufficient_funds_rejects() {
         let mut eng = build_engine();
         add_user(&mut eng, 1);
-        let r = place(&mut eng, 1, 1, Side::Bid, 50_000_000, 100_000_000, TimeInForce::Gtc);
-        assert!(matches!(r.status, CommandStatus::Rejected(RejectReason::InsufficientFunds)));
+        let r = place(
+            &mut eng,
+            1,
+            1,
+            Side::Bid,
+            50_000_000,
+            100_000_000,
+            TimeInForce::Gtc,
+        );
+        assert!(matches!(
+            r.status,
+            CommandStatus::Rejected(RejectReason::InsufficientFunds)
+        ));
+    }
+
+    #[test]
+    fn metrics_record_real_commands() {
+        let mut eng = build_engine();
+        add_user(&mut eng, 1);
+        add_user(&mut eng, 2);
+        deposit(&mut eng, 1, 1, 100_000_000);
+        deposit(&mut eng, 2, 2, 1_000_000_000);
+
+        place(
+            &mut eng,
+            1,
+            1,
+            Side::Ask,
+            50_000_000,
+            100_000_000,
+            TimeInForce::Gtc,
+        );
+        place(
+            &mut eng,
+            2,
+            2,
+            Side::Bid,
+            50_000_000,
+            100_000_000,
+            TimeInForce::Ioc,
+        );
+
+        let snapshot = eng.metrics_snapshot();
+        // Multiple commands processed.
+        assert!(snapshot.contains("me_commands_total"));
+        assert!(snapshot.contains("me_place_orders_total 2"));
+        // The two-sided trade produced one Trade event.
+        assert!(snapshot.contains("me_trades_total 1"));
+        // No rejections.
+        assert!(snapshot.contains("me_rejected_total 0"));
+        // last_applied_seq updated.
+        let m = eng.metrics();
+        assert!(m.commands_total.load(std::sync::atomic::Ordering::Relaxed) > 0);
     }
 
     #[test]
@@ -998,7 +1220,9 @@ mod tests {
     #[test]
     fn submit_batch_matches_n_individual_submits() {
         // Build the same scenario both ways and compare end state.
-        fn run<F: FnMut(&mut MatchingEngine, Vec<(Command, Timestamp)>)>(mut driver: F) -> MatchingEngine {
+        fn run<F: FnMut(&mut MatchingEngine, Vec<(Command, Timestamp)>)>(
+            mut driver: F,
+        ) -> MatchingEngine {
             let mut eng = build_engine();
             let t = Timestamp(0);
             let cmds = vec![
@@ -1116,7 +1340,15 @@ mod tests {
         deposit(&mut eng, 1, 1, 100_000_000);
         deposit(&mut eng, 2, 2, 10_000_000_000);
 
-        place(&mut eng, 1, 1, Side::Ask, 50_000_000, 100_000_000, TimeInForce::Gtc);
+        place(
+            &mut eng,
+            1,
+            1,
+            Side::Ask,
+            50_000_000,
+            100_000_000,
+            TimeInForce::Gtc,
+        );
         let r = place_market(&mut eng, 2, 2, Side::Bid, Some(60_000_000), 50_000_000);
         // Filled at maker price 50e6, not at the 60e6 reserve.
         assert_eq!(r.status, CommandStatus::Filled);
@@ -1131,7 +1363,15 @@ mod tests {
         deposit(&mut eng, 2, 2, 10_000_000_000);
 
         // Buyer has a bid at 30e6 (much lower than 50e6 mid).
-        place(&mut eng, 2, 1, Side::Bid, 30_000_000, 50_000_000, TimeInForce::Gtc);
+        place(
+            &mut eng,
+            2,
+            1,
+            Side::Bid,
+            30_000_000,
+            50_000_000,
+            TimeInForce::Gtc,
+        );
         // Seller market-asks 50M — should hit the 30e6 bid regardless of "fair" price.
         let r = place_market(&mut eng, 1, 2, Side::Ask, None, 50_000_000);
         assert_eq!(r.status, CommandStatus::Filled);
@@ -1144,7 +1384,10 @@ mod tests {
         deposit(&mut eng, 1, 2, 10_000_000_000);
 
         let r = place_market(&mut eng, 1, 1, Side::Bid, None, 50_000_000);
-        assert!(matches!(r.status, CommandStatus::Rejected(RejectReason::MissingPrice)));
+        assert!(matches!(
+            r.status,
+            CommandStatus::Rejected(RejectReason::MissingPrice)
+        ));
     }
 
     // ---- Stop orders (M5.2.c) ----
@@ -1196,12 +1439,31 @@ mod tests {
         deposit(&mut eng, 2, 2, 10_000_000_000);
 
         // Resting ask at 50e6 so a triggered buy stop has liquidity.
-        place(&mut eng, 1, 1, Side::Ask, 50_000_000, 100_000_000, TimeInForce::Gtc);
+        place(
+            &mut eng,
+            1,
+            1,
+            Side::Ask,
+            50_000_000,
+            100_000_000,
+            TimeInForce::Gtc,
+        );
         // Buy stop @ 55e6 with limit 60e6. Mark unset/below 55 → pending.
-        let r = place_stop_limit(&mut eng, 2, 2, Side::Bid, 55_000_000, 60_000_000, 50_000_000);
+        let r = place_stop_limit(
+            &mut eng,
+            2,
+            2,
+            Side::Bid,
+            55_000_000,
+            60_000_000,
+            50_000_000,
+        );
         assert_eq!(r.status, CommandStatus::Accepted);
         // No trade yet — the resting ask is untouched.
-        assert_eq!(eng.book(SymbolId(1)).unwrap().best_ask(), Some(Price(50_000_000)));
+        assert_eq!(
+            eng.book(SymbolId(1)).unwrap().best_ask(),
+            Some(Price(50_000_000))
+        );
     }
 
     #[test]
@@ -1212,8 +1474,24 @@ mod tests {
         deposit(&mut eng, 1, 1, 100_000_000);
         deposit(&mut eng, 2, 2, 10_000_000_000);
 
-        place(&mut eng, 1, 1, Side::Ask, 50_000_000, 100_000_000, TimeInForce::Gtc);
-        place_stop_limit(&mut eng, 2, 2, Side::Bid, 55_000_000, 60_000_000, 50_000_000);
+        place(
+            &mut eng,
+            1,
+            1,
+            Side::Ask,
+            50_000_000,
+            100_000_000,
+            TimeInForce::Gtc,
+        );
+        place_stop_limit(
+            &mut eng,
+            2,
+            2,
+            Side::Bid,
+            55_000_000,
+            60_000_000,
+            50_000_000,
+        );
 
         // Mark rises to 55e6 → stop triggers.
         let r = eng.submit(
@@ -1233,7 +1511,10 @@ mod tests {
         assert_eq!(trade.size, Size(50_000_000));
         assert_eq!(trade.price, Price(50_000_000));
         // 50M of the original 100M ask remains on the book.
-        assert_eq!(eng.book(SymbolId(1)).unwrap().best_ask(), Some(Price(50_000_000)));
+        assert_eq!(
+            eng.book(SymbolId(1)).unwrap().best_ask(),
+            Some(Price(50_000_000))
+        );
     }
 
     #[test]
@@ -1245,9 +1526,25 @@ mod tests {
         deposit(&mut eng, 2, 2, 10_000_000_000);
 
         // Resting bid at 40e6.
-        place(&mut eng, 2, 1, Side::Bid, 40_000_000, 50_000_000, TimeInForce::Gtc);
+        place(
+            &mut eng,
+            2,
+            1,
+            Side::Bid,
+            40_000_000,
+            50_000_000,
+            TimeInForce::Gtc,
+        );
         // Sell stop @ 45e6 with limit 39e6. Mark not set → pending.
-        place_stop_limit(&mut eng, 1, 2, Side::Ask, 45_000_000, 39_000_000, 50_000_000);
+        place_stop_limit(
+            &mut eng,
+            1,
+            2,
+            Side::Ask,
+            45_000_000,
+            39_000_000,
+            50_000_000,
+        );
 
         // Set mark BELOW the stop price → triggers.
         set_mark(&mut eng, 44_000_000);
@@ -1263,8 +1560,24 @@ mod tests {
         deposit(&mut eng, 1, 1, 100_000_000);
         deposit(&mut eng, 2, 2, 10_000_000_000);
 
-        place(&mut eng, 1, 1, Side::Ask, 50_000_000, 100_000_000, TimeInForce::Gtc);
-        place_stop_limit(&mut eng, 2, 2, Side::Bid, 55_000_000, 60_000_000, 50_000_000);
+        place(
+            &mut eng,
+            1,
+            1,
+            Side::Ask,
+            50_000_000,
+            100_000_000,
+            TimeInForce::Gtc,
+        );
+        place_stop_limit(
+            &mut eng,
+            2,
+            2,
+            Side::Bid,
+            55_000_000,
+            60_000_000,
+            50_000_000,
+        );
 
         // Mark moves but doesn't reach 55e6.
         set_mark(&mut eng, 54_999_999);
@@ -1301,7 +1614,11 @@ mod tests {
         size: i64,
     ) -> OrderId {
         let r = place(eng, uid, coid, side, price, size, TimeInForce::Gtc);
-        match r.events.iter().find(|e| matches!(e, Event::OrderAccepted(_))) {
+        match r
+            .events
+            .iter()
+            .find(|e| matches!(e, Event::OrderAccepted(_)))
+        {
             Some(Event::OrderAccepted(a)) => a.order_id,
             _ => panic!("expected OrderAccepted"),
         }
@@ -1317,11 +1634,20 @@ mod tests {
 
         let r = modify_order(&mut eng, 1, oid.0, Some(48_000_000), None);
         // Old order cancelled, new order placed at new price.
-        let cancelled = r.events.iter().any(|e| matches!(e, Event::OrderCancelled(c) if c.order_id == oid));
-        let accepted_new = r.events.iter().any(|e| matches!(e, Event::OrderAccepted(a) if a.order_id != oid));
+        let cancelled = r
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::OrderCancelled(c) if c.order_id == oid));
+        let accepted_new = r
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::OrderAccepted(a) if a.order_id != oid));
         assert!(cancelled, "old order should be cancelled");
         assert!(accepted_new, "new order should be accepted");
-        assert_eq!(eng.book(SymbolId(1)).unwrap().best_bid(), Some(Price(48_000_000)));
+        assert_eq!(
+            eng.book(SymbolId(1)).unwrap().best_bid(),
+            Some(Price(48_000_000))
+        );
     }
 
     #[test]
@@ -1334,7 +1660,11 @@ mod tests {
         let r = modify_order(&mut eng, 1, oid.0, None, Some(4_000_000));
         assert!(matches!(r.status, CommandStatus::Accepted));
         // New order's size is 4M, at original price.
-        let new_oid = match r.events.iter().find(|e| matches!(e, Event::OrderAccepted(a) if a.order_id != oid)) {
+        let new_oid = match r
+            .events
+            .iter()
+            .find(|e| matches!(e, Event::OrderAccepted(a) if a.order_id != oid))
+        {
             Some(Event::OrderAccepted(a)) => a.order_id,
             _ => panic!("no new accepted"),
         };
@@ -1352,7 +1682,11 @@ mod tests {
         let oid = place_get_order_id(&mut eng, 1, 1, Side::Bid, 50_000_000, 5_000_000);
         let r = modify_order(&mut eng, 1, oid.0, None, Some(20_000_000));
         assert!(matches!(r.status, CommandStatus::Accepted));
-        let new_oid = match r.events.iter().find(|e| matches!(e, Event::OrderAccepted(a) if a.order_id != oid)) {
+        let new_oid = match r
+            .events
+            .iter()
+            .find(|e| matches!(e, Event::OrderAccepted(a) if a.order_id != oid))
+        {
             Some(Event::OrderAccepted(a)) => a.order_id,
             _ => panic!("no new accepted"),
         };
@@ -1367,7 +1701,10 @@ mod tests {
         deposit(&mut eng, 1, 2, 10_000_000_000);
 
         let r = modify_order(&mut eng, 1, 999, Some(48_000_000), None);
-        assert!(matches!(r.status, CommandStatus::Rejected(RejectReason::UnknownOrder)));
+        assert!(matches!(
+            r.status,
+            CommandStatus::Rejected(RejectReason::UnknownOrder)
+        ));
     }
 
     #[test]
@@ -1380,9 +1717,15 @@ mod tests {
         let oid = place_get_order_id(&mut eng, 1, 1, Side::Bid, 50_000_000, 10_000_000);
         // User 2 tries to modify user 1's order.
         let r = modify_order(&mut eng, 2, oid.0, Some(48_000_000), None);
-        assert!(matches!(r.status, CommandStatus::Rejected(RejectReason::UnknownOrder)));
+        assert!(matches!(
+            r.status,
+            CommandStatus::Rejected(RejectReason::UnknownOrder)
+        ));
         // Original order still on the book.
-        assert_eq!(eng.book(SymbolId(1)).unwrap().best_bid(), Some(Price(50_000_000)));
+        assert_eq!(
+            eng.book(SymbolId(1)).unwrap().best_bid(),
+            Some(Price(50_000_000))
+        );
     }
 
     #[test]
@@ -1396,7 +1739,10 @@ mod tests {
         let oid = place_get_order_id(&mut eng, 1, 1, Side::Bid, 50_000_000, 10_000_000);
         // Try to grow to 200M (notional 100_000_000) — too expensive.
         let r = modify_order(&mut eng, 1, oid.0, None, Some(2_000_000_000));
-        assert!(matches!(r.status, CommandStatus::Rejected(RejectReason::InsufficientFunds)));
+        assert!(matches!(
+            r.status,
+            CommandStatus::Rejected(RejectReason::InsufficientFunds)
+        ));
         // Old order is gone (cancelled atomically), held funds returned.
         assert!(eng.book(SymbolId(1)).unwrap().get_order(oid).is_none());
         let user1 = eng.risk().account(UserId(1)).unwrap();
@@ -1425,7 +1771,10 @@ mod tests {
             }),
             Timestamp(0),
         );
-        assert!(matches!(r.status, CommandStatus::Rejected(RejectReason::MissingPrice)));
+        assert!(matches!(
+            r.status,
+            CommandStatus::Rejected(RejectReason::MissingPrice)
+        ));
     }
 
     #[test]

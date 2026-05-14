@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::{enums::*, ids::*, numeric::*, reject::*};
+use serde::{Deserialize, Serialize};
 
 /// Events emitted as the pipeline processes a Command. Consumed by the risk
 /// engine for settlement and by external subscribers (market data, audit).

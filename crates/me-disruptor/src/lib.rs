@@ -13,10 +13,10 @@
 //!   engine in me-core currently runs all three logical stages on a single
 //!   consumer thread because RiskEngine is unsharded.
 
-pub mod sequence;
 pub mod ring;
+pub mod sequence;
 pub mod wait;
 
-pub use sequence::Sequence;
 pub use ring::RingBuffer;
+pub use sequence::Sequence;
 pub use wait::{BusySpinStrategy, WaitStrategy, YieldingStrategy};

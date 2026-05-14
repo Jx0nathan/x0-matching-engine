@@ -58,7 +58,10 @@ impl UserAccount {
     }
 
     pub fn free(&self, currency: CurrencyId) -> Amount {
-        self.balances.get(&currency).copied().unwrap_or(Amount::ZERO)
+        self.balances
+            .get(&currency)
+            .copied()
+            .unwrap_or(Amount::ZERO)
     }
 
     pub fn held(&self, currency: CurrencyId) -> Amount {

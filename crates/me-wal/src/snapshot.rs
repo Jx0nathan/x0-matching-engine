@@ -100,7 +100,10 @@ mod tests {
     fn save_then_load_roundtrip() {
         let dir = tempdir().unwrap();
         let store = SnapshotStore::open(dir.path()).unwrap();
-        let s = DummyState { x: 42, y: "hello".into() };
+        let s = DummyState {
+            x: 42,
+            y: "hello".into(),
+        };
         store.save(&s, SeqNo(7)).unwrap();
         let loaded: DummyState = store.load(SeqNo(7)).unwrap();
         assert_eq!(s, loaded);
@@ -111,19 +114,42 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = SnapshotStore::open(dir.path()).unwrap();
         for seq in [3u64, 10, 1, 5] {
-            store.save(&DummyState { x: seq as i64, y: "".into() }, SeqNo(seq)).unwrap();
+            store
+                .save(
+                    &DummyState {
+                        x: seq as i64,
+                        y: "".into(),
+                    },
+                    SeqNo(seq),
+                )
+                .unwrap();
         }
         let list = store.list().unwrap();
-        assert_eq!(list.iter().map(|e| e.seq_no.0).collect::<Vec<_>>(), [1, 3, 5, 10]);
+        assert_eq!(
+            list.iter().map(|e| e.seq_no.0).collect::<Vec<_>>(),
+            [1, 3, 5, 10]
+        );
     }
 
     #[test]
     fn latest_returns_max_seq() {
         let dir = tempdir().unwrap();
         let store = SnapshotStore::open(dir.path()).unwrap();
-        store.save(&DummyState { x: 1, y: "".into() }, SeqNo(1)).unwrap();
-        store.save(&DummyState { x: 99, y: "".into() }, SeqNo(99)).unwrap();
-        store.save(&DummyState { x: 5, y: "".into() }, SeqNo(5)).unwrap();
+        store
+            .save(&DummyState { x: 1, y: "".into() }, SeqNo(1))
+            .unwrap();
+        store
+            .save(
+                &DummyState {
+                    x: 99,
+                    y: "".into(),
+                },
+                SeqNo(99),
+            )
+            .unwrap();
+        store
+            .save(&DummyState { x: 5, y: "".into() }, SeqNo(5))
+            .unwrap();
         let latest = store.latest().unwrap().unwrap();
         assert_eq!(latest.seq_no, SeqNo(99));
     }
@@ -132,8 +158,24 @@ mod tests {
     fn load_latest_returns_state_and_seq() {
         let dir = tempdir().unwrap();
         let store = SnapshotStore::open(dir.path()).unwrap();
-        store.save(&DummyState { x: 1, y: "a".into() }, SeqNo(1)).unwrap();
-        store.save(&DummyState { x: 2, y: "b".into() }, SeqNo(2)).unwrap();
+        store
+            .save(
+                &DummyState {
+                    x: 1,
+                    y: "a".into(),
+                },
+                SeqNo(1),
+            )
+            .unwrap();
+        store
+            .save(
+                &DummyState {
+                    x: 2,
+                    y: "b".into(),
+                },
+                SeqNo(2),
+            )
+            .unwrap();
         let (state, seq): (DummyState, SeqNo) = store.load_latest().unwrap().unwrap();
         assert_eq!(seq, SeqNo(2));
         assert_eq!(state.y, "b");

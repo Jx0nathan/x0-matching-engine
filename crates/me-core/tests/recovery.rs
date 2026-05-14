@@ -14,8 +14,8 @@ use std::collections::BTreeMap;
 use me_core::MatchingEngine;
 use me_types::{
     AddUser, AdjustBalance, Amount, Bps, CancelOrder, ClientOrderId, Command, CurrencyId,
-    FeeSchedule, OrderType, PlaceOrder, Price, PriceBand, SelfTradePrevention, Side, Size, SymbolId,
-    SymbolKindParams, SymbolSpec, TimeInForce, Timestamp, UserId,
+    FeeSchedule, OrderType, PlaceOrder, Price, PriceBand, SelfTradePrevention, Side, Size,
+    SymbolId, SymbolKindParams, SymbolSpec, TimeInForce, Timestamp, UserId,
 };
 use tempfile::tempdir;
 
@@ -34,7 +34,10 @@ fn spec() -> SymbolSpec {
         lot_size: Size(1),
         min_order_size: Size(1),
         max_order_size: Size(i64::MAX),
-        fee_schedule: FeeSchedule { maker_bps: Bps(10), taker_bps: Bps(20) },
+        fee_schedule: FeeSchedule {
+            maker_bps: Bps(10),
+            taker_bps: Bps(20),
+        },
         price_band: PriceBand::none(),
         kind_params: SymbolKindParams::Spot,
         is_suspended: false,
@@ -86,7 +89,12 @@ impl StateSummary {
 }
 
 fn add_user(eng: &mut MatchingEngine, uid: u64) {
-    eng.submit(Command::AddUser(AddUser { user_id: UserId(uid) }), Timestamp(0));
+    eng.submit(
+        Command::AddUser(AddUser {
+            user_id: UserId(uid),
+        }),
+        Timestamp(0),
+    );
 }
 
 fn deposit(eng: &mut MatchingEngine, uid: u64, cur: CurrencyId, amt: i64) {
@@ -148,16 +156,64 @@ fn seed_scenario(eng: &mut MatchingEngine) {
     deposit(eng, 1, BTC, 200_000_000);
     deposit(eng, 2, USDT, 5_000_000_000);
     deposit(eng, 3, USDT, 1_000_000_000);
-    place(eng, 1, 1, Side::Ask, 50_000_000, 80_000_000, TimeInForce::Gtc);
-    place(eng, 2, 2, Side::Bid, 50_000_000, 30_000_000, TimeInForce::Ioc);
-    place(eng, 3, 3, Side::Bid, 49_000_000, 10_000_000, TimeInForce::Gtc);
-    place(eng, 1, 4, Side::Ask, 51_000_000, 50_000_000, TimeInForce::Gtc);
+    place(
+        eng,
+        1,
+        1,
+        Side::Ask,
+        50_000_000,
+        80_000_000,
+        TimeInForce::Gtc,
+    );
+    place(
+        eng,
+        2,
+        2,
+        Side::Bid,
+        50_000_000,
+        30_000_000,
+        TimeInForce::Ioc,
+    );
+    place(
+        eng,
+        3,
+        3,
+        Side::Bid,
+        49_000_000,
+        10_000_000,
+        TimeInForce::Gtc,
+    );
+    place(
+        eng,
+        1,
+        4,
+        Side::Ask,
+        51_000_000,
+        50_000_000,
+        TimeInForce::Gtc,
+    );
 }
 
 fn extra_post_snapshot(eng: &mut MatchingEngine) {
-    place(eng, 2, 5, Side::Bid, 51_000_000, 25_000_000, TimeInForce::Ioc);
+    place(
+        eng,
+        2,
+        5,
+        Side::Bid,
+        51_000_000,
+        25_000_000,
+        TimeInForce::Ioc,
+    );
     cancel(eng, 3, 7); // 3's resting bid — order_id depends on internal counter
-    place(eng, 3, 6, Side::Bid, 50_500_000, 5_000_000, TimeInForce::Gtc);
+    place(
+        eng,
+        3,
+        6,
+        Side::Bid,
+        50_500_000,
+        5_000_000,
+        TimeInForce::Gtc,
+    );
 }
 
 #[test]
@@ -170,21 +226,14 @@ fn replay_from_wal_only_reproduces_state() {
         let mut eng = MatchingEngine::with_persistence(&wal, &snap).unwrap();
         seed_scenario(&mut eng);
         extra_post_snapshot(&mut eng);
-        StateSummary::from_engine(
-            &eng,
-            &[UserId(1), UserId(2), UserId(3)],
-            &[BTC_USDT],
-        )
+        StateSummary::from_engine(&eng, &[UserId(1), UserId(2), UserId(3)], &[BTC_USDT])
     };
 
     // Engine B opens cold; no snapshot exists yet, so it must reconstruct
     // every byte of state from the WAL alone.
     let eng_b = MatchingEngine::with_persistence(&wal, &snap).unwrap();
-    let summary_b = StateSummary::from_engine(
-        &eng_b,
-        &[UserId(1), UserId(2), UserId(3)],
-        &[BTC_USDT],
-    );
+    let summary_b =
+        StateSummary::from_engine(&eng_b, &[UserId(1), UserId(2), UserId(3)], &[BTC_USDT]);
 
     assert_eq!(summary_a, summary_b);
 }
@@ -200,19 +249,12 @@ fn snapshot_plus_wal_delta_reproduces_state() {
         seed_scenario(&mut eng);
         eng.take_snapshot().unwrap();
         extra_post_snapshot(&mut eng);
-        StateSummary::from_engine(
-            &eng,
-            &[UserId(1), UserId(2), UserId(3)],
-            &[BTC_USDT],
-        )
+        StateSummary::from_engine(&eng, &[UserId(1), UserId(2), UserId(3)], &[BTC_USDT])
     };
 
     let eng_b = MatchingEngine::with_persistence(&wal, &snap).unwrap();
-    let summary_b = StateSummary::from_engine(
-        &eng_b,
-        &[UserId(1), UserId(2), UserId(3)],
-        &[BTC_USDT],
-    );
+    let summary_b =
+        StateSummary::from_engine(&eng_b, &[UserId(1), UserId(2), UserId(3)], &[BTC_USDT]);
 
     assert_eq!(summary_a, summary_b);
 }
@@ -227,19 +269,12 @@ fn snapshot_only_no_wal_delta_reproduces_state() {
         let mut eng = MatchingEngine::with_persistence(&wal, &snap).unwrap();
         seed_scenario(&mut eng);
         eng.take_snapshot().unwrap();
-        StateSummary::from_engine(
-            &eng,
-            &[UserId(1), UserId(2), UserId(3)],
-            &[BTC_USDT],
-        )
+        StateSummary::from_engine(&eng, &[UserId(1), UserId(2), UserId(3)], &[BTC_USDT])
     };
 
     let eng_b = MatchingEngine::with_persistence(&wal, &snap).unwrap();
-    let summary_b = StateSummary::from_engine(
-        &eng_b,
-        &[UserId(1), UserId(2), UserId(3)],
-        &[BTC_USDT],
-    );
+    let summary_b =
+        StateSummary::from_engine(&eng_b, &[UserId(1), UserId(2), UserId(3)], &[BTC_USDT]);
 
     assert_eq!(summary_a, summary_b);
 }

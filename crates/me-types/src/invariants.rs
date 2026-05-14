@@ -1,5 +1,5 @@
-use std::collections::{HashMap, HashSet};
 use crate::{ids::CurrencyId, numeric::Amount};
+use std::collections::{HashMap, HashSet};
 
 /// Conservation invariant for an exchange's books.
 ///

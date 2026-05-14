@@ -1,6 +1,6 @@
+use crate::{event::Event, ids::SeqNo, reject::RejectReason};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
-use crate::{event::Event, ids::SeqNo, reject::RejectReason};
 
 /// Final outcome of processing a CommandEnvelope. Returned to the caller and
 /// also broadcast for audit. The events list is the full transcript of what

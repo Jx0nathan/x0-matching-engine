@@ -65,9 +65,7 @@ pub enum HoldKind {
     /// Spot order: hold is in quote for Bid (sized at reserve_price), in base
     /// for Ask (1:1 with size). Settles by transferring base/quote between
     /// the two users.
-    Spot {
-        bid_reserve_price: Option<Price>,
-    },
+    Spot { bid_reserve_price: Option<Price> },
     /// Derivative order: hold is always in quote currency, sized at order
     /// price × IMR (plus fee). On fill, margin moves from the user's
     /// account.holds bucket into the per-symbol Position.margin_locked.
@@ -98,8 +96,10 @@ pub struct RiskEngine {
 impl RiskEngine {
     pub fn new() -> Self {
         let mut me = Self::default();
-        me.accounts.insert(EXCHANGE_ACCOUNT, UserAccount::new(EXCHANGE_ACCOUNT));
-        me.accounts.insert(INSURANCE_FUND, UserAccount::new(INSURANCE_FUND));
+        me.accounts
+            .insert(EXCHANGE_ACCOUNT, UserAccount::new(EXCHANGE_ACCOUNT));
+        me.accounts
+            .insert(INSURANCE_FUND, UserAccount::new(INSURANCE_FUND));
         me
     }
 
@@ -115,19 +115,28 @@ impl RiskEngine {
     }
 
     pub fn suspend(&mut self, user_id: UserId) -> Result<(), RejectReason> {
-        let acct = self.accounts.get_mut(&user_id).ok_or(RejectReason::UnknownUser)?;
+        let acct = self
+            .accounts
+            .get_mut(&user_id)
+            .ok_or(RejectReason::UnknownUser)?;
         acct.is_suspended = true;
         Ok(())
     }
 
     pub fn resume(&mut self, user_id: UserId) -> Result<(), RejectReason> {
-        let acct = self.accounts.get_mut(&user_id).ok_or(RejectReason::UnknownUser)?;
+        let acct = self
+            .accounts
+            .get_mut(&user_id)
+            .ok_or(RejectReason::UnknownUser)?;
         acct.is_suspended = false;
         Ok(())
     }
 
     pub fn adjust_balance(&mut self, cmd: &AdjustBalance) -> Result<(), RejectReason> {
-        let acct = self.accounts.get_mut(&cmd.user_id).ok_or(RejectReason::UnknownUser)?;
+        let acct = self
+            .accounts
+            .get_mut(&cmd.user_id)
+            .ok_or(RejectReason::UnknownUser)?;
         if cmd.delta.raw() >= 0 {
             acct.credit_free(cmd.currency_id, cmd.delta);
             Ok(())
@@ -158,8 +167,7 @@ impl RiskEngine {
         self.accounts
             .values()
             .map(|a| {
-                let balance_part =
-                    a.free(currency).raw() as i128 + a.held(currency).raw() as i128;
+                let balance_part = a.free(currency).raw() as i128 + a.held(currency).raw() as i128;
                 let position_part: i128 = a
                     .positions
                     .values()
@@ -209,8 +217,7 @@ impl RiskEngine {
                     if scale <= 0 {
                         continue;
                     }
-                    let diff =
-                        (mark.raw() as i128) - (position.entry_price.raw() as i128);
+                    let diff = (mark.raw() as i128) - (position.entry_price.raw() as i128);
                     let raw = diff * (position.size.raw() as i128);
                     let entry = per_symbol_unrealized_raw
                         .entry(*symbol_id)
@@ -254,24 +261,29 @@ impl RiskEngine {
         if spec.lot_size.raw() > 0 && cmd.size.raw() % spec.lot_size.raw() != 0 {
             return Err(RejectReason::SizeLotMisaligned);
         }
-        if let (Some(ref_price), Some(upper)) =
-            (spec.price_band.reference_price, spec.price_band.upper_bps_from_ref)
-        {
+        if let (Some(ref_price), Some(upper)) = (
+            spec.price_band.reference_price,
+            spec.price_band.upper_bps_from_ref,
+        ) {
             let limit = (ref_price.raw() as i128) * (10_000 + upper.raw() as i128) / 10_000;
             if (price.raw() as i128) > limit {
                 return Err(RejectReason::PriceBandViolation);
             }
         }
-        if let (Some(ref_price), Some(lower)) =
-            (spec.price_band.reference_price, spec.price_band.lower_bps_from_ref)
-        {
+        if let (Some(ref_price), Some(lower)) = (
+            spec.price_band.reference_price,
+            spec.price_band.lower_bps_from_ref,
+        ) {
             let limit = (ref_price.raw() as i128) * (10_000 - lower.raw() as i128) / 10_000;
             if (price.raw() as i128) < limit {
                 return Err(RejectReason::PriceBandViolation);
             }
         }
 
-        let account = self.accounts.get_mut(&cmd.user_id).ok_or(RejectReason::UnknownUser)?;
+        let account = self
+            .accounts
+            .get_mut(&cmd.user_id)
+            .ok_or(RejectReason::UnknownUser)?;
         if account.is_suspended {
             return Err(RejectReason::UserSuspended);
         }
@@ -316,7 +328,9 @@ impl RiskEngine {
                 let fee = gross
                     .mul_bps_ceil(spec.fee_schedule.taker_bps)
                     .ok_or(RejectReason::ArithmeticOverflow)?;
-                let hold = gross.checked_add(fee).ok_or(RejectReason::ArithmeticOverflow)?;
+                let hold = gross
+                    .checked_add(fee)
+                    .ok_or(RejectReason::ArithmeticOverflow)?;
                 (spec.quote_currency, hold, Some(reserve))
             }
             Side::Ask => (spec.base_currency, Amount(cmd.size.raw()), None),
@@ -386,10 +400,15 @@ impl RiskEngine {
         let new_required_margin = new_notional
             .mul_bps_ceil(params.initial_margin_bps)
             .ok_or(RejectReason::ArithmeticOverflow)?;
-        let reserve_margin = Amount(new_required_margin.raw().saturating_sub(current_margin).max(0));
+        let reserve_margin = Amount(
+            new_required_margin
+                .raw()
+                .saturating_sub(current_margin)
+                .max(0),
+        );
 
-        let total_notional = quote_amount(price, cmd.size, spec)
-            .ok_or(RejectReason::ArithmeticOverflow)?;
+        let total_notional =
+            quote_amount(price, cmd.size, spec).ok_or(RejectReason::ArithmeticOverflow)?;
         let reserve_fee = total_notional
             .mul_bps_ceil(spec.fee_schedule.taker_bps)
             .ok_or(RejectReason::ArithmeticOverflow)?;
@@ -619,8 +638,12 @@ impl RiskEngine {
         is_taker: bool,
         spec: &SymbolSpec,
     ) -> Result<Option<Hold>, RejectReason> {
-        let HoldKind::Derivative { reserve_margin, reserve_fee, original_size, ref_price: _ } =
-            hold.kind
+        let HoldKind::Derivative {
+            reserve_margin,
+            reserve_fee,
+            original_size,
+            ref_price: _,
+        } = hold.kind
         else {
             unreachable!("settle_derivative called on non-derivative hold");
         };
@@ -640,8 +663,7 @@ impl RiskEngine {
             .unwrap_or(0);
         let abs_contribution = contribution_signed.unsigned_abs() as i64;
         let abs_prev = prev_signed.unsigned_abs() as i64;
-        let is_opposite =
-            prev_signed != 0 && (prev_signed > 0) != (contribution_signed > 0);
+        let is_opposite = prev_signed != 0 && (prev_signed > 0) != (contribution_signed > 0);
         let is_flip = is_opposite && abs_contribution > abs_prev;
         let is_reducing = is_opposite && !is_flip;
 
@@ -663,8 +685,8 @@ impl RiskEngine {
         } else {
             spec.fee_schedule.maker_bps
         };
-        let actual_notional = quote_amount(trade.price, trade.size, spec)
-            .ok_or(RejectReason::ArithmeticOverflow)?;
+        let actual_notional =
+            quote_amount(trade.price, trade.size, spec).ok_or(RejectReason::ArithmeticOverflow)?;
         let actual_fee = actual_notional
             .mul_bps_ceil(fee_bps)
             .ok_or(RejectReason::ArithmeticOverflow)?;
@@ -915,7 +937,9 @@ impl RiskEngine {
         // Drain the fee reserve from holds. Pay actual fee; slack to free;
         // shortfall pulled from free.
         acct.sub_from_hold(hold.currency, reserved_total_for_fill);
-        let slack = reserved_total_for_fill.raw().saturating_sub(actual_fee.raw());
+        let slack = reserved_total_for_fill
+            .raw()
+            .saturating_sub(actual_fee.raw());
         if slack > 0 {
             acct.credit_free(hold.currency, Amount(slack));
         }
@@ -970,7 +994,10 @@ impl RiskEngine {
             .accounts
             .get_mut(&hold.user_id)
             .ok_or(RejectReason::UnknownUser)?;
-        let quote_bal = acct.balances.entry(spec.quote_currency).or_insert(Amount::ZERO);
+        let quote_bal = acct
+            .balances
+            .entry(spec.quote_currency)
+            .or_insert(Amount::ZERO);
         *quote_bal = Amount(quote_bal.raw() + released + realized_pnl);
 
         let revenue = self
@@ -993,11 +1020,7 @@ impl RiskEngine {
     /// Scan all open positions on `spec.symbol_id`. For each position whose
     /// (margin_locked + unrealized_pnl_at_mark) < MMR × notional_at_mark,
     /// force-close at `mark` and return a report.
-    pub fn scan_liquidations(
-        &mut self,
-        spec: &SymbolSpec,
-        mark: Price,
-    ) -> Vec<LiquidationReport> {
+    pub fn scan_liquidations(&mut self, spec: &SymbolSpec, mark: Price) -> Vec<LiquidationReport> {
         let mmr_bps = match &spec.kind_params {
             SymbolKindParams::PerpetualSwap(p) => p.maintenance_margin_bps,
             SymbolKindParams::Future(f) => f.maintenance_margin_bps,
@@ -1019,7 +1042,8 @@ impl RiskEngine {
                     continue;
                 }
                 let abs_size = position.size.raw().unsigned_abs() as i128;
-                let notional = (mark.raw() as i128) * abs_size / (spec.base_minor_per_major as i128);
+                let notional =
+                    (mark.raw() as i128) * abs_size / (spec.base_minor_per_major as i128);
                 let pnl_per_unit = if position.size.raw() > 0 {
                     mark.raw() as i128 - position.entry_price.raw() as i128
                 } else {
@@ -1082,7 +1106,10 @@ impl RiskEngine {
                 .accounts
                 .get_mut(&user_id)
                 .expect("user existence already checked");
-            let quote_bal = acct.balances.entry(spec.quote_currency).or_insert(Amount::ZERO);
+            let quote_bal = acct
+                .balances
+                .entry(spec.quote_currency)
+                .or_insert(Amount::ZERO);
             *quote_bal = Amount(quote_bal.raw() + released_margin + pnl);
             let new_bal = quote_bal.raw();
 
@@ -1149,8 +1176,12 @@ impl RiskEngine {
                 continue;
             }
             let payment = {
-                let Some(acct) = self.accounts.get(&user_id) else { continue; };
-                let Some(position) = acct.positions.get(&spec.symbol_id) else { continue; };
+                let Some(acct) = self.accounts.get(&user_id) else {
+                    continue;
+                };
+                let Some(position) = acct.positions.get(&spec.symbol_id) else {
+                    continue;
+                };
                 if position.size.is_zero() {
                     continue;
                 }
@@ -1164,7 +1195,10 @@ impl RiskEngine {
                 continue;
             }
             let acct = self.accounts.get_mut(&user_id).expect("user just observed");
-            let quote_bal = acct.balances.entry(spec.quote_currency).or_insert(Amount::ZERO);
+            let quote_bal = acct
+                .balances
+                .entry(spec.quote_currency)
+                .or_insert(Amount::ZERO);
             *quote_bal = Amount(quote_bal.raw() - payment);
             net_collected += payment as i128;
             reports.push(FundingReport {
@@ -1228,7 +1262,10 @@ mod tests {
             lot_size: Size(1),
             min_order_size: Size(1),
             max_order_size: Size(i64::MAX),
-            fee_schedule: FeeSchedule { maker_bps: Bps(10), taker_bps: Bps(20) },
+            fee_schedule: FeeSchedule {
+                maker_bps: Bps(10),
+                taker_bps: Bps(20),
+            },
             price_band: PriceBand::none(),
             kind_params: SymbolKindParams::Spot,
             is_suspended: false,
@@ -1246,11 +1283,14 @@ mod tests {
             lot_size: Size(1),
             min_order_size: Size(1),
             max_order_size: Size(i64::MAX),
-            fee_schedule: FeeSchedule { maker_bps: Bps(10), taker_bps: Bps(20) },
+            fee_schedule: FeeSchedule {
+                maker_bps: Bps(10),
+                taker_bps: Bps(20),
+            },
             price_band: PriceBand::none(),
             kind_params: SymbolKindParams::PerpetualSwap(PerpParams {
-                initial_margin_bps: Bps(500),       // 5% IM
-                maintenance_margin_bps: Bps(250),   // 2.5% MM
+                initial_margin_bps: Bps(500),     // 5% IM
+                maintenance_margin_bps: Bps(250), // 2.5% MM
                 funding_interval_secs: 28_800,
                 max_leverage: 20,
             }),
@@ -1290,7 +1330,10 @@ mod tests {
         let mut r = RiskEngine::new();
         r.add_user(UserId(1)).unwrap();
         deposit(&mut r, 1, CurrencyId(2), 1_000_000);
-        assert_eq!(r.account(UserId(1)).unwrap().free(CurrencyId(2)), Amount(1_000_000));
+        assert_eq!(
+            r.account(UserId(1)).unwrap().free(CurrencyId(2)),
+            Amount(1_000_000)
+        );
     }
 
     #[test]
@@ -1299,8 +1342,12 @@ mod tests {
         let spec = spec_btc_usdt();
         r.add_user(UserId(1)).unwrap();
         deposit(&mut r, 1, CurrencyId(2), 1_000_000_000);
-        r.pre_check_place(&po(1, SymbolId(1), Side::Bid, 50_000_000, 50_000_000), &spec, OrderId(1))
-            .unwrap();
+        r.pre_check_place(
+            &po(1, SymbolId(1), Side::Bid, 50_000_000, 50_000_000),
+            &spec,
+            OrderId(1),
+        )
+        .unwrap();
         let a = r.account(UserId(1)).unwrap();
         assert_eq!(a.held(CurrencyId(2)), Amount(25_050_000));
         assert_eq!(a.free(CurrencyId(2)), Amount(1_000_000_000 - 25_050_000));
@@ -1312,8 +1359,12 @@ mod tests {
         let spec = spec_btc_usdt();
         r.add_user(UserId(1)).unwrap();
         deposit(&mut r, 1, CurrencyId(1), 100_000_000);
-        r.pre_check_place(&po(1, SymbolId(1), Side::Ask, 50_000_000, 50_000_000), &spec, OrderId(1))
-            .unwrap();
+        r.pre_check_place(
+            &po(1, SymbolId(1), Side::Ask, 50_000_000, 50_000_000),
+            &spec,
+            OrderId(1),
+        )
+        .unwrap();
         let a = r.account(UserId(1)).unwrap();
         assert_eq!(a.held(CurrencyId(1)), Amount(50_000_000));
         assert_eq!(a.free(CurrencyId(1)), Amount(50_000_000));
@@ -1325,8 +1376,12 @@ mod tests {
         let spec = spec_btc_usdt();
         r.add_user(UserId(1)).unwrap();
         deposit(&mut r, 1, CurrencyId(2), 1_000_000_000);
-        r.pre_check_place(&po(1, SymbolId(1), Side::Bid, 50_000_000, 50_000_000), &spec, OrderId(1))
-            .unwrap();
+        r.pre_check_place(
+            &po(1, SymbolId(1), Side::Bid, 50_000_000, 50_000_000),
+            &spec,
+            OrderId(1),
+        )
+        .unwrap();
         r.release_hold(OrderId(1)).unwrap();
         let a = r.account(UserId(1)).unwrap();
         assert_eq!(a.held(CurrencyId(2)), Amount::ZERO);
@@ -1351,10 +1406,18 @@ mod tests {
         let total_btc_before = r.total_internal(CurrencyId(1));
         let total_usdt_before = r.total_internal(CurrencyId(2));
 
-        r.pre_check_place(&po(1, SymbolId(1), Side::Ask, 50_000_000, 100_000_000), &spec, OrderId(1))
-            .unwrap();
-        r.pre_check_place(&po(2, SymbolId(1), Side::Bid, 50_000_000, 100_000_000), &spec, OrderId(2))
-            .unwrap();
+        r.pre_check_place(
+            &po(1, SymbolId(1), Side::Ask, 50_000_000, 100_000_000),
+            &spec,
+            OrderId(1),
+        )
+        .unwrap();
+        r.pre_check_place(
+            &po(2, SymbolId(1), Side::Bid, 50_000_000, 100_000_000),
+            &spec,
+            OrderId(2),
+        )
+        .unwrap();
 
         let trade = Trade {
             symbol_id: SymbolId(1),
@@ -1374,8 +1437,17 @@ mod tests {
         assert!(r.hold(OrderId(1)).is_none());
         assert!(r.hold(OrderId(2)).is_none());
         assert!(r.account(UserId(1)).unwrap().free(CurrencyId(2)).raw() > 0);
-        assert_eq!(r.account(UserId(2)).unwrap().free(CurrencyId(1)), Amount(100_000_000));
-        assert!(r.account(EXCHANGE_ACCOUNT).unwrap().free(CurrencyId(2)).raw() > 0);
+        assert_eq!(
+            r.account(UserId(2)).unwrap().free(CurrencyId(1)),
+            Amount(100_000_000)
+        );
+        assert!(
+            r.account(EXCHANGE_ACCOUNT)
+                .unwrap()
+                .free(CurrencyId(2))
+                .raw()
+                > 0
+        );
     }
 
     #[test]
@@ -1386,10 +1458,18 @@ mod tests {
         r.add_user(UserId(2)).unwrap();
         deposit(&mut r, 1, CurrencyId(1), 100_000_000);
         deposit(&mut r, 2, CurrencyId(2), 1_000_000_000);
-        r.pre_check_place(&po(1, SymbolId(1), Side::Ask, 50_000_000, 100_000_000), &spec, OrderId(1))
-            .unwrap();
-        r.pre_check_place(&po(2, SymbolId(1), Side::Bid, 50_000_000, 100_000_000), &spec, OrderId(2))
-            .unwrap();
+        r.pre_check_place(
+            &po(1, SymbolId(1), Side::Ask, 50_000_000, 100_000_000),
+            &spec,
+            OrderId(1),
+        )
+        .unwrap();
+        r.pre_check_place(
+            &po(2, SymbolId(1), Side::Bid, 50_000_000, 100_000_000),
+            &spec,
+            OrderId(2),
+        )
+        .unwrap();
         let trade = Trade {
             symbol_id: SymbolId(1),
             price: Price(50_000_000),
@@ -1420,8 +1500,12 @@ mod tests {
         // margin = 25_000_000 * 500 / 10_000 = 1_250_000
         // fee = 25_000_000 * 20 / 10_000 = 50_000
         // total locked = 1_300_000
-        r.pre_check_place(&po(1, SymbolId(2), Side::Bid, 50_000_000, 50_000_000), &spec, OrderId(1))
-            .unwrap();
+        r.pre_check_place(
+            &po(1, SymbolId(2), Side::Bid, 50_000_000, 50_000_000),
+            &spec,
+            OrderId(1),
+        )
+        .unwrap();
         let a = r.account(UserId(1)).unwrap();
         assert_eq!(a.held(CurrencyId(2)), Amount(1_300_000));
         assert_eq!(a.free(CurrencyId(2)), Amount(10_000_000_000 - 1_300_000));
@@ -1436,10 +1520,18 @@ mod tests {
         // Flip: ask 80M at price 55e6 → close 50M long + open 30M short.
         r.add_user(UserId(3)).unwrap();
         deposit(&mut r, 3, CurrencyId(2), 10_000_000_000);
-        r.pre_check_place(&po(1, SymbolId(2), Side::Ask, 55_000_000, 80_000_000), &spec, OrderId(3))
-            .unwrap();
-        r.pre_check_place(&po(3, SymbolId(2), Side::Bid, 55_000_000, 80_000_000), &spec, OrderId(4))
-            .unwrap();
+        r.pre_check_place(
+            &po(1, SymbolId(2), Side::Ask, 55_000_000, 80_000_000),
+            &spec,
+            OrderId(3),
+        )
+        .unwrap();
+        r.pre_check_place(
+            &po(3, SymbolId(2), Side::Bid, 55_000_000, 80_000_000),
+            &spec,
+            OrderId(4),
+        )
+        .unwrap();
         r.apply_trade(
             &Trade {
                 symbol_id: SymbolId(2),
@@ -1482,10 +1574,18 @@ mod tests {
         };
         let total_before = r.total_internal_with_marks(CurrencyId(2), mark);
 
-        r.pre_check_place(&po(1, SymbolId(2), Side::Ask, 55_000_000, 80_000_000), &spec, OrderId(3))
-            .unwrap();
-        r.pre_check_place(&po(3, SymbolId(2), Side::Bid, 55_000_000, 80_000_000), &spec, OrderId(4))
-            .unwrap();
+        r.pre_check_place(
+            &po(1, SymbolId(2), Side::Ask, 55_000_000, 80_000_000),
+            &spec,
+            OrderId(3),
+        )
+        .unwrap();
+        r.pre_check_place(
+            &po(3, SymbolId(2), Side::Bid, 55_000_000, 80_000_000),
+            &spec,
+            OrderId(4),
+        )
+        .unwrap();
         r.apply_trade(
             &Trade {
                 symbol_id: SymbolId(2),
@@ -1571,10 +1671,18 @@ mod tests {
         deposit(&mut r, 2, CurrencyId(2), 10_000_000_000);
 
         // U1 opens 50M long at 50e6; U2 takes the short.
-        r.pre_check_place(&po(1, SymbolId(2), Side::Bid, 50_000_000, 50_000_000), &spec, OrderId(1))
-            .unwrap();
-        r.pre_check_place(&po(2, SymbolId(2), Side::Ask, 50_000_000, 50_000_000), &spec, OrderId(2))
-            .unwrap();
+        r.pre_check_place(
+            &po(1, SymbolId(2), Side::Bid, 50_000_000, 50_000_000),
+            &spec,
+            OrderId(1),
+        )
+        .unwrap();
+        r.pre_check_place(
+            &po(2, SymbolId(2), Side::Ask, 50_000_000, 50_000_000),
+            &spec,
+            OrderId(2),
+        )
+        .unwrap();
         r.apply_trade(
             &Trade {
                 symbol_id: SymbolId(2),
@@ -1619,10 +1727,18 @@ mod tests {
         deposit(&mut r, 1, CurrencyId(2), 1_300_000);
         deposit(&mut r, 2, CurrencyId(2), 10_000_000_000);
 
-        r.pre_check_place(&po(1, SymbolId(2), Side::Bid, 50_000_000, 50_000_000), &spec, OrderId(1))
-            .unwrap();
-        r.pre_check_place(&po(2, SymbolId(2), Side::Ask, 50_000_000, 50_000_000), &spec, OrderId(2))
-            .unwrap();
+        r.pre_check_place(
+            &po(1, SymbolId(2), Side::Bid, 50_000_000, 50_000_000),
+            &spec,
+            OrderId(1),
+        )
+        .unwrap();
+        r.pre_check_place(
+            &po(2, SymbolId(2), Side::Ask, 50_000_000, 50_000_000),
+            &spec,
+            OrderId(2),
+        )
+        .unwrap();
         r.apply_trade(
             &Trade {
                 symbol_id: SymbolId(2),
@@ -1662,10 +1778,18 @@ mod tests {
         deposit(&mut r, 1, CurrencyId(2), 10_000_000_000);
         deposit(&mut r, 2, CurrencyId(2), 10_000_000_000);
 
-        r.pre_check_place(&po(1, SymbolId(2), Side::Bid, 50_000_000, 50_000_000), &spec, OrderId(1))
-            .unwrap();
-        r.pre_check_place(&po(2, SymbolId(2), Side::Ask, 50_000_000, 50_000_000), &spec, OrderId(2))
-            .unwrap();
+        r.pre_check_place(
+            &po(1, SymbolId(2), Side::Bid, 50_000_000, 50_000_000),
+            &spec,
+            OrderId(1),
+        )
+        .unwrap();
+        r.pre_check_place(
+            &po(2, SymbolId(2), Side::Ask, 50_000_000, 50_000_000),
+            &spec,
+            OrderId(2),
+        )
+        .unwrap();
         r.apply_trade(
             &Trade {
                 symbol_id: SymbolId(2),
@@ -1703,10 +1827,18 @@ mod tests {
         deposit(&mut r, 3, CurrencyId(2), 10_000_000_000);
 
         // U1 opens long 50M; U2 takes short 50M.
-        r.pre_check_place(&po(1, SymbolId(2), Side::Bid, 50_000_000, 50_000_000), &spec, OrderId(1))
-            .unwrap();
-        r.pre_check_place(&po(2, SymbolId(2), Side::Ask, 50_000_000, 50_000_000), &spec, OrderId(2))
-            .unwrap();
+        r.pre_check_place(
+            &po(1, SymbolId(2), Side::Bid, 50_000_000, 50_000_000),
+            &spec,
+            OrderId(1),
+        )
+        .unwrap();
+        r.pre_check_place(
+            &po(2, SymbolId(2), Side::Ask, 50_000_000, 50_000_000),
+            &spec,
+            OrderId(2),
+        )
+        .unwrap();
         r.apply_trade(
             &Trade {
                 symbol_id: SymbolId(2),
@@ -1732,12 +1864,20 @@ mod tests {
         // Simpler: open U3 short alongside U1's long — total long = 50M, total
         // short = 100M. Now imbalanced.
         deposit(&mut r, 3, CurrencyId(2), 10_000_000_000);
-        r.pre_check_place(&po(3, SymbolId(2), Side::Ask, 50_000_000, 50_000_000), &spec, OrderId(3))
-            .unwrap();
+        r.pre_check_place(
+            &po(3, SymbolId(2), Side::Ask, 50_000_000, 50_000_000),
+            &spec,
+            OrderId(3),
+        )
+        .unwrap();
         r.add_user(UserId(4)).unwrap();
         deposit(&mut r, 4, CurrencyId(2), 10_000_000_000);
-        r.pre_check_place(&po(4, SymbolId(2), Side::Bid, 50_000_000, 50_000_000), &spec, OrderId(4))
-            .unwrap();
+        r.pre_check_place(
+            &po(4, SymbolId(2), Side::Bid, 50_000_000, 50_000_000),
+            &spec,
+            OrderId(4),
+        )
+        .unwrap();
         r.apply_trade(
             &Trade {
                 symbol_id: SymbolId(2),
@@ -1771,10 +1911,18 @@ mod tests {
         r.add_user(UserId(2)).unwrap();
         deposit(r, 1, CurrencyId(2), 10_000_000_000);
         deposit(r, 2, CurrencyId(2), 10_000_000_000);
-        r.pre_check_place(&po(1, SymbolId(2), Side::Bid, 50_000_000, 50_000_000), spec, OrderId(1))
-            .unwrap();
-        r.pre_check_place(&po(2, SymbolId(2), Side::Ask, 50_000_000, 50_000_000), spec, OrderId(2))
-            .unwrap();
+        r.pre_check_place(
+            &po(1, SymbolId(2), Side::Bid, 50_000_000, 50_000_000),
+            spec,
+            OrderId(1),
+        )
+        .unwrap();
+        r.pre_check_place(
+            &po(2, SymbolId(2), Side::Ask, 50_000_000, 50_000_000),
+            spec,
+            OrderId(2),
+        )
+        .unwrap();
         r.apply_trade(
             &Trade {
                 symbol_id: SymbolId(2),
@@ -1799,16 +1947,29 @@ mod tests {
         open_50m_long_at_50(&mut r, &spec);
 
         let u1_before_quote = r.account(UserId(1)).unwrap().free(CurrencyId(2)).raw();
-        let u1_before_position_margin =
-            r.account(UserId(1)).unwrap().position(SymbolId(2)).unwrap().margin_locked.raw();
+        let u1_before_position_margin = r
+            .account(UserId(1))
+            .unwrap()
+            .position(SymbolId(2))
+            .unwrap()
+            .margin_locked
+            .raw();
 
         // U3 takes U1's close at higher price (60e6) → U1 closes at profit.
         r.add_user(UserId(3)).unwrap();
         deposit(&mut r, 3, CurrencyId(2), 10_000_000_000);
-        r.pre_check_place(&po(1, SymbolId(2), Side::Ask, 60_000_000, 50_000_000), &spec, OrderId(3))
-            .unwrap();
-        r.pre_check_place(&po(3, SymbolId(2), Side::Bid, 60_000_000, 50_000_000), &spec, OrderId(4))
-            .unwrap();
+        r.pre_check_place(
+            &po(1, SymbolId(2), Side::Ask, 60_000_000, 50_000_000),
+            &spec,
+            OrderId(3),
+        )
+        .unwrap();
+        r.pre_check_place(
+            &po(3, SymbolId(2), Side::Bid, 60_000_000, 50_000_000),
+            &spec,
+            OrderId(4),
+        )
+        .unwrap();
         r.apply_trade(
             &Trade {
                 symbol_id: SymbolId(2),
@@ -1846,16 +2007,29 @@ mod tests {
         let spec = spec_btc_perp();
         open_50m_long_at_50(&mut r, &spec);
 
-        let pos_before = r.account(UserId(1)).unwrap().position(SymbolId(2)).unwrap().clone();
+        let pos_before = r
+            .account(UserId(1))
+            .unwrap()
+            .position(SymbolId(2))
+            .unwrap()
+            .clone();
         let prev_margin = pos_before.margin_locked.raw();
 
         // Reduce 20M of 50M long at price 55e6.
         r.add_user(UserId(3)).unwrap();
         deposit(&mut r, 3, CurrencyId(2), 10_000_000_000);
-        r.pre_check_place(&po(1, SymbolId(2), Side::Ask, 55_000_000, 20_000_000), &spec, OrderId(3))
-            .unwrap();
-        r.pre_check_place(&po(3, SymbolId(2), Side::Bid, 55_000_000, 20_000_000), &spec, OrderId(4))
-            .unwrap();
+        r.pre_check_place(
+            &po(1, SymbolId(2), Side::Ask, 55_000_000, 20_000_000),
+            &spec,
+            OrderId(3),
+        )
+        .unwrap();
+        r.pre_check_place(
+            &po(3, SymbolId(2), Side::Bid, 55_000_000, 20_000_000),
+            &spec,
+            OrderId(4),
+        )
+        .unwrap();
         r.apply_trade(
             &Trade {
                 symbol_id: SymbolId(2),
@@ -1908,10 +2082,18 @@ mod tests {
 
         let total_before = r.total_internal_with_marks(CurrencyId(2), mark);
 
-        r.pre_check_place(&po(1, SymbolId(2), Side::Ask, 55_000_000, 20_000_000), &spec, OrderId(3))
-            .unwrap();
-        r.pre_check_place(&po(3, SymbolId(2), Side::Bid, 55_000_000, 20_000_000), &spec, OrderId(4))
-            .unwrap();
+        r.pre_check_place(
+            &po(1, SymbolId(2), Side::Ask, 55_000_000, 20_000_000),
+            &spec,
+            OrderId(3),
+        )
+        .unwrap();
+        r.pre_check_place(
+            &po(3, SymbolId(2), Side::Bid, 55_000_000, 20_000_000),
+            &spec,
+            OrderId(4),
+        )
+        .unwrap();
         r.apply_trade(
             &Trade {
                 symbol_id: SymbolId(2),
@@ -1943,16 +2125,29 @@ mod tests {
         open_50m_long_at_50(&mut r, &spec);
 
         let u1_before_quote = r.account(UserId(1)).unwrap().free(CurrencyId(2)).raw();
-        let u1_before_position_margin =
-            r.account(UserId(1)).unwrap().position(SymbolId(2)).unwrap().margin_locked.raw();
+        let u1_before_position_margin = r
+            .account(UserId(1))
+            .unwrap()
+            .position(SymbolId(2))
+            .unwrap()
+            .margin_locked
+            .raw();
 
         // Close at 40e6 (worse than 50e6 entry) → loss of 5M.
         r.add_user(UserId(3)).unwrap();
         deposit(&mut r, 3, CurrencyId(2), 10_000_000_000);
-        r.pre_check_place(&po(1, SymbolId(2), Side::Ask, 40_000_000, 50_000_000), &spec, OrderId(3))
-            .unwrap();
-        r.pre_check_place(&po(3, SymbolId(2), Side::Bid, 40_000_000, 50_000_000), &spec, OrderId(4))
-            .unwrap();
+        r.pre_check_place(
+            &po(1, SymbolId(2), Side::Ask, 40_000_000, 50_000_000),
+            &spec,
+            OrderId(3),
+        )
+        .unwrap();
+        r.pre_check_place(
+            &po(3, SymbolId(2), Side::Bid, 40_000_000, 50_000_000),
+            &spec,
+            OrderId(4),
+        )
+        .unwrap();
         r.apply_trade(
             &Trade {
                 symbol_id: SymbolId(2),
@@ -1986,10 +2181,18 @@ mod tests {
         deposit(&mut r, 2, CurrencyId(2), 10_000_000_000);
 
         // User 1 opens long at 50e6 for size 40M.
-        r.pre_check_place(&po(1, SymbolId(2), Side::Bid, 50_000_000, 40_000_000), &spec, OrderId(1))
-            .unwrap();
-        r.pre_check_place(&po(2, SymbolId(2), Side::Ask, 50_000_000, 40_000_000), &spec, OrderId(2))
-            .unwrap();
+        r.pre_check_place(
+            &po(1, SymbolId(2), Side::Bid, 50_000_000, 40_000_000),
+            &spec,
+            OrderId(1),
+        )
+        .unwrap();
+        r.pre_check_place(
+            &po(2, SymbolId(2), Side::Ask, 50_000_000, 40_000_000),
+            &spec,
+            OrderId(2),
+        )
+        .unwrap();
         r.apply_trade(
             &Trade {
                 symbol_id: SymbolId(2),
@@ -2009,10 +2212,18 @@ mod tests {
         // User 1 increases long at 60e6 for size 60M.
         r.add_user(UserId(3)).unwrap();
         deposit(&mut r, 3, CurrencyId(2), 10_000_000_000);
-        r.pre_check_place(&po(1, SymbolId(2), Side::Bid, 60_000_000, 60_000_000), &spec, OrderId(3))
-            .unwrap();
-        r.pre_check_place(&po(3, SymbolId(2), Side::Ask, 60_000_000, 60_000_000), &spec, OrderId(4))
-            .unwrap();
+        r.pre_check_place(
+            &po(1, SymbolId(2), Side::Bid, 60_000_000, 60_000_000),
+            &spec,
+            OrderId(3),
+        )
+        .unwrap();
+        r.pre_check_place(
+            &po(3, SymbolId(2), Side::Ask, 60_000_000, 60_000_000),
+            &spec,
+            OrderId(4),
+        )
+        .unwrap();
         r.apply_trade(
             &Trade {
                 symbol_id: SymbolId(2),

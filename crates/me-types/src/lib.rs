@@ -13,21 +13,21 @@
 //!   path) is added in M3 only on the subset of types that actually go through
 //!   the journal.
 
-pub mod ids;
-pub mod numeric;
-pub mod enums;
-pub mod reject;
 pub mod command;
+pub mod enums;
 pub mod event;
-pub mod receipt;
-pub mod symbol;
+pub mod ids;
 pub mod invariants;
+pub mod numeric;
+pub mod receipt;
+pub mod reject;
+pub mod symbol;
 
+pub use command::*;
+pub use enums::*;
+pub use event::*;
 pub use ids::*;
 pub use numeric::*;
-pub use enums::*;
-pub use reject::*;
-pub use command::*;
-pub use event::*;
 pub use receipt::*;
+pub use reject::*;
 pub use symbol::*;

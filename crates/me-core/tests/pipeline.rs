@@ -28,7 +28,10 @@ fn spec() -> SymbolSpec {
         lot_size: Size(1),
         min_order_size: Size(1),
         max_order_size: Size(i64::MAX),
-        fee_schedule: FeeSchedule { maker_bps: Bps(10), taker_bps: Bps(20) },
+        fee_schedule: FeeSchedule {
+            maker_bps: Bps(10),
+            taker_bps: Bps(20),
+        },
         price_band: PriceBand::none(),
         kind_params: SymbolKindParams::Spot,
         is_suspended: false,
@@ -82,7 +85,12 @@ fn build_commands() -> Vec<(Command, Timestamp)> {
 
     v.push((Command::RegisterSymbol(spec()), t));
     for uid in [1u64, 2, 3, 4, 5] {
-        v.push((Command::AddUser(AddUser { user_id: UserId(uid) }), t));
+        v.push((
+            Command::AddUser(AddUser {
+                user_id: UserId(uid),
+            }),
+            t,
+        ));
     }
     v.push(adj(1, BTC, 500_000_000));
     v.push(adj(2, USDT, 10_000_000_000));
@@ -96,15 +104,78 @@ fn build_commands() -> Vec<(Command, Timestamp)> {
         coid
     };
 
-    v.push(place(1, next(), Side::Ask, 50_000_000, 100_000_000, TimeInForce::Gtc));
-    v.push(place(4, next(), Side::Ask, 51_000_000, 80_000_000, TimeInForce::Gtc));
-    v.push(place(4, next(), Side::Ask, 52_000_000, 70_000_000, TimeInForce::Gtc));
-    v.push(place(2, next(), Side::Bid, 50_000_000, 30_000_000, TimeInForce::Ioc));
-    v.push(place(3, next(), Side::Bid, 51_000_000, 60_000_000, TimeInForce::Gtc));
-    v.push(place(5, next(), Side::Bid, 49_000_000, 20_000_000, TimeInForce::PostOnly));
-    v.push(place(2, next(), Side::Bid, 52_000_000, 50_000_000, TimeInForce::Fok));
-    v.push(place(3, next(), Side::Ask, 53_000_000, 10_000_000, TimeInForce::Gtc));
-    v.push(place(5, next(), Side::Bid, 50_000_000, 5_000_000, TimeInForce::Ioc));
+    v.push(place(
+        1,
+        next(),
+        Side::Ask,
+        50_000_000,
+        100_000_000,
+        TimeInForce::Gtc,
+    ));
+    v.push(place(
+        4,
+        next(),
+        Side::Ask,
+        51_000_000,
+        80_000_000,
+        TimeInForce::Gtc,
+    ));
+    v.push(place(
+        4,
+        next(),
+        Side::Ask,
+        52_000_000,
+        70_000_000,
+        TimeInForce::Gtc,
+    ));
+    v.push(place(
+        2,
+        next(),
+        Side::Bid,
+        50_000_000,
+        30_000_000,
+        TimeInForce::Ioc,
+    ));
+    v.push(place(
+        3,
+        next(),
+        Side::Bid,
+        51_000_000,
+        60_000_000,
+        TimeInForce::Gtc,
+    ));
+    v.push(place(
+        5,
+        next(),
+        Side::Bid,
+        49_000_000,
+        20_000_000,
+        TimeInForce::PostOnly,
+    ));
+    v.push(place(
+        2,
+        next(),
+        Side::Bid,
+        52_000_000,
+        50_000_000,
+        TimeInForce::Fok,
+    ));
+    v.push(place(
+        3,
+        next(),
+        Side::Ask,
+        53_000_000,
+        10_000_000,
+        TimeInForce::Gtc,
+    ));
+    v.push(place(
+        5,
+        next(),
+        Side::Bid,
+        50_000_000,
+        5_000_000,
+        TimeInForce::Ioc,
+    ));
     v
 }
 
@@ -197,7 +268,10 @@ fn ring_backpressure_holds_correctness() {
 fn many_submits_no_deadlock() {
     let mut eng = AsyncMatchingEngine::new(MatchingEngine::new(), 16);
     eng.submit(Command::RegisterSymbol(spec()), Timestamp(0));
-    eng.submit(Command::AddUser(AddUser { user_id: UserId(1) }), Timestamp(0));
+    eng.submit(
+        Command::AddUser(AddUser { user_id: UserId(1) }),
+        Timestamp(0),
+    );
     let (dep, _) = adj(1, USDT, 100_000_000_000);
     eng.submit(dep, Timestamp(0));
     for i in 0..500u64 {

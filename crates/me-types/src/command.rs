@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::{enums::*, ids::*, numeric::*, symbol::SymbolSpec};
+use serde::{Deserialize, Serialize};
 
 /// All user-originated input to the engine. Distinct from Event (output) and
 /// CommandReceipt (final outcome). Each variant carries only the fields it

@@ -422,9 +422,7 @@ impl SpotOrderBook {
                 let maker_user_id = self.orders[head_idx].user_id;
 
                 // ---- Self-trade prevention dispatch ----
-                if maker_user_id == taker_user_id
-                    && !matches!(stp, SelfTradePrevention::None)
-                {
+                if maker_user_id == taker_user_id && !matches!(stp, SelfTradePrevention::None) {
                     let maker_remaining = self.orders[head_idx].size_remaining;
                     let maker_order_id = self.orders[head_idx].order_id;
                     let maker_side = self.orders[head_idx].side;
@@ -536,14 +534,12 @@ impl SpotOrderBook {
                     if self.orders[head_idx].hidden_remaining.is_positive() {
                         let slice_cap = self.orders[head_idx].visible_slice;
                         let hidden = self.orders[head_idx].hidden_remaining;
-                        let next_slice =
-                            Size(slice_cap.raw().min(hidden.raw()));
+                        let next_slice = Size(slice_cap.raw().min(hidden.raw()));
                         self.orders[head_idx].size_remaining = next_slice;
                         self.orders[head_idx].hidden_remaining =
                             Size(hidden.raw() - next_slice.raw());
-                        self.buckets[bucket_idx].total_volume = Size(
-                            self.buckets[bucket_idx].total_volume.raw() + next_slice.raw(),
-                        );
+                        self.buckets[bucket_idx].total_volume =
+                            Size(self.buckets[bucket_idx].total_volume.raw() + next_slice.raw());
                         self.relink_head_to_tail(head_idx, bucket_idx);
                         // The taker may still have remaining; loop continues
                         // with the new bucket head (which is whatever was next).
@@ -581,13 +577,12 @@ impl SpotOrderBook {
         // Iceberg: show only the visible slice; remainder is hidden until the
         // slice gets filled. Non-iceberg: visible_slice == 0 → show full size,
         // no hidden quantity.
-        let (initial_visible, hidden) = if visible_slice.raw() > 0
-            && visible_slice.raw() < size.raw()
-        {
-            (visible_slice, Size(size.raw() - visible_slice.raw()))
-        } else {
-            (size, Size::ZERO)
-        };
+        let (initial_visible, hidden) =
+            if visible_slice.raw() > 0 && visible_slice.raw() < size.raw() {
+                (visible_slice, Size(size.raw() - visible_slice.raw()))
+            } else {
+                (size, Size::ZERO)
+            };
 
         let order = RestingOrder {
             order_id,
@@ -623,8 +618,7 @@ impl SpotOrderBook {
     /// portion goes to the back of the FIFO queue, losing time priority.
     fn relink_head_to_tail(&mut self, order_idx: OrderIdx, bucket_idx: BucketIdx) {
         // If only order in the bucket, nothing to do.
-        if self.buckets[bucket_idx].tail == order_idx
-            && self.buckets[bucket_idx].head == order_idx
+        if self.buckets[bucket_idx].tail == order_idx && self.buckets[bucket_idx].head == order_idx
         {
             return;
         }
@@ -709,14 +703,29 @@ mod tests {
     use super::*;
     use me_types::OrderType;
 
-    fn place(book: &mut SpotOrderBook, oid: u64, uid: u64, side: Side, px: i64, sz: i64,
-             tif: TimeInForce) -> PlacementOutcome {
+    fn place(
+        book: &mut SpotOrderBook,
+        oid: u64,
+        uid: u64,
+        side: Side,
+        px: i64,
+        sz: i64,
+        tif: TimeInForce,
+    ) -> PlacementOutcome {
         place_stp(book, oid, uid, side, px, sz, tif, SelfTradePrevention::None)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn place_stp(book: &mut SpotOrderBook, oid: u64, uid: u64, side: Side, px: i64, sz: i64,
-                 tif: TimeInForce, stp: SelfTradePrevention) -> PlacementOutcome {
+    fn place_stp(
+        book: &mut SpotOrderBook,
+        oid: u64,
+        uid: u64,
+        side: Side,
+        px: i64,
+        sz: i64,
+        tif: TimeInForce,
+        stp: SelfTradePrevention,
+    ) -> PlacementOutcome {
         book.place(PlaceParams {
             order_id: OrderId(oid),
             user_id: UserId(uid),
@@ -733,8 +742,15 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn place_iceberg(book: &mut SpotOrderBook, oid: u64, uid: u64, side: Side, px: i64, sz: i64,
-                     visible: i64) -> PlacementOutcome {
+    fn place_iceberg(
+        book: &mut SpotOrderBook,
+        oid: u64,
+        uid: u64,
+        side: Side,
+        px: i64,
+        sz: i64,
+        visible: i64,
+    ) -> PlacementOutcome {
         book.place(PlaceParams {
             order_id: OrderId(oid),
             user_id: UserId(uid),
@@ -866,8 +882,16 @@ mod tests {
     fn stp_none_allows_self_trade() {
         let mut book = SpotOrderBook::new(SymbolId(1));
         place(&mut book, 1, 100, Side::Ask, 100, 5, TimeInForce::Gtc);
-        let r = place_stp(&mut book, 2, 100, Side::Bid, 100, 5, TimeInForce::Gtc,
-                           SelfTradePrevention::None);
+        let r = place_stp(
+            &mut book,
+            2,
+            100,
+            Side::Bid,
+            100,
+            5,
+            TimeInForce::Gtc,
+            SelfTradePrevention::None,
+        );
         assert_eq!(r.trades.len(), 1);
         assert!(r.stp_cancellations.is_empty());
         assert_eq!(r.filled, Size(5));
@@ -877,8 +901,16 @@ mod tests {
     fn stp_cancel_taker_stops_match() {
         let mut book = SpotOrderBook::new(SymbolId(1));
         place(&mut book, 1, 100, Side::Ask, 100, 5, TimeInForce::Gtc);
-        let r = place_stp(&mut book, 2, 100, Side::Bid, 100, 5, TimeInForce::Gtc,
-                           SelfTradePrevention::CancelTaker);
+        let r = place_stp(
+            &mut book,
+            2,
+            100,
+            Side::Bid,
+            100,
+            5,
+            TimeInForce::Gtc,
+            SelfTradePrevention::CancelTaker,
+        );
         assert!(r.trades.is_empty());
         assert!(r.stp_cancellations.is_empty());
         // Taker stopped, didn't rest (Gtc rests only if positive remaining
@@ -897,8 +929,16 @@ mod tests {
         // Two asks at 100: one same-user (uid=100), one other (uid=101).
         place(&mut book, 1, 100, Side::Ask, 100, 5, TimeInForce::Gtc);
         place(&mut book, 2, 101, Side::Ask, 100, 5, TimeInForce::Gtc);
-        let r = place_stp(&mut book, 3, 100, Side::Bid, 100, 8, TimeInForce::Gtc,
-                           SelfTradePrevention::CancelMaker);
+        let r = place_stp(
+            &mut book,
+            3,
+            100,
+            Side::Bid,
+            100,
+            8,
+            TimeInForce::Gtc,
+            SelfTradePrevention::CancelMaker,
+        );
         // Same-user maker removed (oid=1), trade happens against oid=2 (5 size).
         assert_eq!(r.stp_cancellations.len(), 1);
         assert_eq!(r.stp_cancellations[0].order_id, OrderId(1));
@@ -915,8 +955,16 @@ mod tests {
         let mut book = SpotOrderBook::new(SymbolId(1));
         place(&mut book, 1, 100, Side::Ask, 100, 5, TimeInForce::Gtc);
         place(&mut book, 2, 101, Side::Ask, 100, 5, TimeInForce::Gtc);
-        let r = place_stp(&mut book, 3, 100, Side::Bid, 100, 8, TimeInForce::Gtc,
-                           SelfTradePrevention::CancelBoth);
+        let r = place_stp(
+            &mut book,
+            3,
+            100,
+            Side::Bid,
+            100,
+            8,
+            TimeInForce::Gtc,
+            SelfTradePrevention::CancelBoth,
+        );
         assert_eq!(r.stp_cancellations.len(), 1);
         assert_eq!(r.stp_cancellations[0].order_id, OrderId(1));
         assert!(r.trades.is_empty());
@@ -932,8 +980,16 @@ mod tests {
         // Same-user maker size 3, then other-user maker size 10.
         place(&mut book, 1, 100, Side::Ask, 100, 3, TimeInForce::Gtc);
         place(&mut book, 2, 101, Side::Ask, 100, 10, TimeInForce::Gtc);
-        let r = place_stp(&mut book, 3, 100, Side::Bid, 100, 8, TimeInForce::Gtc,
-                           SelfTradePrevention::DecrementAndCancel);
+        let r = place_stp(
+            &mut book,
+            3,
+            100,
+            Side::Bid,
+            100,
+            8,
+            TimeInForce::Gtc,
+            SelfTradePrevention::DecrementAndCancel,
+        );
         // Same-user maker cancelled, taker decrements by 3 → 5 left.
         // Then taker matches 5 of the other-user maker normally.
         assert_eq!(r.stp_cancellations.len(), 1);
@@ -950,8 +1006,16 @@ mod tests {
     fn stp_decrement_and_cancel_maker_larger_than_taker() {
         let mut book = SpotOrderBook::new(SymbolId(1));
         place(&mut book, 1, 100, Side::Ask, 100, 10, TimeInForce::Gtc);
-        let r = place_stp(&mut book, 2, 100, Side::Bid, 100, 3, TimeInForce::Gtc,
-                           SelfTradePrevention::DecrementAndCancel);
+        let r = place_stp(
+            &mut book,
+            2,
+            100,
+            Side::Bid,
+            100,
+            3,
+            TimeInForce::Gtc,
+            SelfTradePrevention::DecrementAndCancel,
+        );
         // Maker has 10, taker is 3. Reduce maker to 7, taker fully neutralised.
         assert_eq!(r.stp_cancellations.len(), 1);
         assert_eq!(r.stp_cancellations[0].order_id, OrderId(1));
@@ -968,8 +1032,16 @@ mod tests {
     fn stp_decrement_and_cancel_equal_sizes() {
         let mut book = SpotOrderBook::new(SymbolId(1));
         place(&mut book, 1, 100, Side::Ask, 100, 5, TimeInForce::Gtc);
-        let r = place_stp(&mut book, 2, 100, Side::Bid, 100, 5, TimeInForce::Gtc,
-                           SelfTradePrevention::DecrementAndCancel);
+        let r = place_stp(
+            &mut book,
+            2,
+            100,
+            Side::Bid,
+            100,
+            5,
+            TimeInForce::Gtc,
+            SelfTradePrevention::DecrementAndCancel,
+        );
         assert_eq!(r.stp_cancellations.len(), 1);
         // Maker fully cancelled, taker neutralised to 0.
         assert!(r.stp_cancellations[0].full_cancel);
@@ -1075,8 +1147,16 @@ mod tests {
     fn stp_does_not_apply_when_users_differ() {
         let mut book = SpotOrderBook::new(SymbolId(1));
         place(&mut book, 1, 100, Side::Ask, 100, 5, TimeInForce::Gtc);
-        let r = place_stp(&mut book, 2, 200, Side::Bid, 100, 5, TimeInForce::Gtc,
-                           SelfTradePrevention::CancelBoth);
+        let r = place_stp(
+            &mut book,
+            2,
+            200,
+            Side::Bid,
+            100,
+            5,
+            TimeInForce::Gtc,
+            SelfTradePrevention::CancelBoth,
+        );
         assert!(r.stp_cancellations.is_empty());
         assert_eq!(r.trades.len(), 1);
         assert_eq!(r.filled, Size(5));

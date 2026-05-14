@@ -38,10 +38,7 @@ impl WalWriter {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Self {
             path,
             file: BufWriter::with_capacity(64 * 1024, file),
@@ -152,7 +149,9 @@ impl WalReader {
         if actual_crc != expected_crc {
             return Err(WalError::Corrupt {
                 offset: self.offset,
-                message: format!("crc mismatch: expected {expected_crc:#010x}, got {actual_crc:#010x}"),
+                message: format!(
+                    "crc mismatch: expected {expected_crc:#010x}, got {actual_crc:#010x}"
+                ),
             });
         }
 
@@ -194,7 +193,9 @@ mod tests {
         CommandEnvelope {
             seq_no: SeqNo(seq),
             received_at: Timestamp(seq as i64),
-            command: Command::AddUser(AddUser { user_id: UserId(uid) }),
+            command: Command::AddUser(AddUser {
+                user_id: UserId(uid),
+            }),
         }
     }
 
@@ -268,7 +269,11 @@ mod tests {
         }
         // Flip a single byte deep in the payload (after the [len][crc] header)
         // — CRC32 will catch this even if bincode would have silently decoded.
-        let mut f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let mut f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
         f.seek(SeekFrom::Start(12)).unwrap(); // skip 4 len + 4 crc + first 4 payload
         f.write_all(&[0xAAu8]).unwrap();
         drop(f);
@@ -293,7 +298,11 @@ mod tests {
         // Zero everything after the length header. Without CRC the reader
         // would attempt to bincode-decode garbage; with CRC the corruption
         // is caught at the checksum step.
-        let mut f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let mut f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
         let total = f.metadata().unwrap().len();
         f.seek(SeekFrom::Start(4)).unwrap();
         let zeros = vec![0x00u8; (total - 4) as usize];

@@ -4,7 +4,7 @@ English | [中文](./README.md)
 
 Production-targeted matching engine for spot + perpetual/futures, written in Rust.
 
-> **Status: M5.4 (insurance fund) complete.** New `INSURANCE_FUND = UserId(u64::MAX)` system account. Liquidation losses exceeding the user's margin (which would drive balance negative) are absorbed by the insurance fund — user balance is zeroed, deficit debited from insurance. Funding-rate settlement also routes the OI-imbalance residual through insurance. Insurance fund itself may go negative under extreme drawdowns (ADL / socialised losses left for M5+). M5.3 modify, M5.2 order types, M5.1 STP, M4 derivatives, M3 persistence all preserved. See `CLAUDE.md`.
+> **Status: M5.5 (Prometheus metrics + CI) complete.** `MatchingEngine::metrics_snapshot()` renders Prometheus text format directly (counters for commands/trades/liquidations/WAL syncs/stops; gauges for `last_applied_seq`, insurance fund balance, exchange revenue, per-symbol resting orders, per-currency `total_internal`). GitHub Actions CI runs fmt, clippy `-D warnings`, full workspace tests, release build, and a 1000-case conservation property test on every push and PR. See `CLAUDE.md`.
 
 ## Design goals
 

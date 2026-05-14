@@ -67,7 +67,9 @@ impl AsyncMatchingEngine {
         let shut_down_for_thread = shut_down.clone();
         let consumer = thread::Builder::new()
             .name("me-engine-consumer".into())
-            .spawn(move || run_consumer(engine, ring_for_thread, consumer_seq, shut_down_for_thread))
+            .spawn(move || {
+                run_consumer(engine, ring_for_thread, consumer_seq, shut_down_for_thread)
+            })
             .expect("spawn engine consumer thread");
 
         Self {
@@ -97,7 +99,8 @@ impl AsyncMatchingEngine {
             slot.is_shutdown = false;
         }
         self.ring.publish(seq);
-        rx.recv().expect("engine consumer disconnected before sending receipt")
+        rx.recv()
+            .expect("engine consumer disconnected before sending receipt")
     }
 
     /// Halt the consumer, join the thread, return the inner engine for inspection.
@@ -157,7 +160,12 @@ fn run_consumer(
         for seq in (current + 1)..=available {
             let (cmd, ts, response, is_shutdown) = unsafe {
                 let slot = ring.slot(seq);
-                (slot.cmd.clone(), slot.ts, slot.response.clone(), slot.is_shutdown)
+                (
+                    slot.cmd.clone(),
+                    slot.ts,
+                    slot.response.clone(),
+                    slot.is_shutdown,
+                )
             };
             if is_shutdown {
                 shutdown_at = Some(seq);

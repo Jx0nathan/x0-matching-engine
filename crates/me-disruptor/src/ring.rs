@@ -166,7 +166,9 @@ mod tests {
             for i in 0..100u64 {
                 let seq = producer_ring.next_seq(cur);
                 cur = seq;
-                unsafe { *producer_ring.slot_mut(seq) = i * 10; }
+                unsafe {
+                    *producer_ring.slot_mut(seq) = i * 10;
+                }
                 producer_ring.publish(seq);
             }
         });
@@ -204,7 +206,9 @@ mod tests {
         for i in 0..4u64 {
             let seq = ring.next_seq(cur);
             cur = seq;
-            unsafe { *ring.slot_mut(seq) = i; }
+            unsafe {
+                *ring.slot_mut(seq) = i;
+            }
             ring.publish(seq);
         }
 

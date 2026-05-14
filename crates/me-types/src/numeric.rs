@@ -4,25 +4,33 @@ use std::ops::{Add, AddAssign, Neg, Sub, SubAssign};
 
 /// Price in the symbol's minor quote units. Scale and tick-alignment policy
 /// live in `SymbolSpec`, never on this type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 #[repr(transparent)]
 #[serde(transparent)]
 pub struct Price(pub i64);
 
 /// Quantity in the symbol's minor base units. Lot-alignment lives in `SymbolSpec`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 #[repr(transparent)]
 #[serde(transparent)]
 pub struct Size(pub i64);
 
 /// Monetary amount in some currency's minor units. Signed: PnL can be negative.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 #[repr(transparent)]
 #[serde(transparent)]
 pub struct Amount(pub i64);
 
 /// Basis points: 1 bp = 0.01% = 1/10_000. Stored as u32 (10_000 bps = 100%).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 #[repr(transparent)]
 #[serde(transparent)]
 pub struct Bps(pub u32);
@@ -32,8 +40,14 @@ impl Price {
     pub const MIN: Self = Self(i64::MIN);
     pub const MAX: Self = Self(i64::MAX);
 
-    #[inline] pub const fn new(v: i64) -> Self { Self(v) }
-    #[inline] pub const fn raw(self) -> i64 { self.0 }
+    #[inline]
+    pub const fn new(v: i64) -> Self {
+        Self(v)
+    }
+    #[inline]
+    pub const fn raw(self) -> i64 {
+        self.0
+    }
 
     /// Raw product `Price × Size` widened to i128. Always safe — i64×i64 fits
     /// in i128 with room to spare. Caller applies symbol scale and rounding.
@@ -48,10 +62,22 @@ impl Size {
     pub const MIN: Self = Self(i64::MIN);
     pub const MAX: Self = Self(i64::MAX);
 
-    #[inline] pub const fn new(v: i64) -> Self { Self(v) }
-    #[inline] pub const fn raw(self) -> i64 { self.0 }
-    #[inline] pub const fn is_zero(self) -> bool { self.0 == 0 }
-    #[inline] pub const fn is_positive(self) -> bool { self.0 > 0 }
+    #[inline]
+    pub const fn new(v: i64) -> Self {
+        Self(v)
+    }
+    #[inline]
+    pub const fn raw(self) -> i64 {
+        self.0
+    }
+    #[inline]
+    pub const fn is_zero(self) -> bool {
+        self.0 == 0
+    }
+    #[inline]
+    pub const fn is_positive(self) -> bool {
+        self.0 > 0
+    }
 
     #[inline]
     pub fn checked_add(self, rhs: Size) -> Option<Size> {
@@ -85,9 +111,18 @@ impl Amount {
     pub const MIN: Self = Self(i64::MIN);
     pub const MAX: Self = Self(i64::MAX);
 
-    #[inline] pub const fn new(v: i64) -> Self { Self(v) }
-    #[inline] pub const fn raw(self) -> i64 { self.0 }
-    #[inline] pub const fn is_zero(self) -> bool { self.0 == 0 }
+    #[inline]
+    pub const fn new(v: i64) -> Self {
+        Self(v)
+    }
+    #[inline]
+    pub const fn raw(self) -> i64 {
+        self.0
+    }
+    #[inline]
+    pub const fn is_zero(self) -> bool {
+        self.0 == 0
+    }
 
     #[inline]
     pub fn checked_add(self, rhs: Amount) -> Option<Amount> {
@@ -136,28 +171,100 @@ impl Bps {
     pub const ONE_PERCENT: Self = Self(100);
     pub const FULL: Self = Self(10_000);
 
-    #[inline] pub const fn new(v: u32) -> Self { Self(v) }
-    #[inline] pub const fn raw(self) -> u32 { self.0 }
+    #[inline]
+    pub const fn new(v: u32) -> Self {
+        Self(v)
+    }
+    #[inline]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
 }
 
-impl fmt::Display for Price  { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.0.fmt(f) } }
-impl fmt::Display for Size   { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.0.fmt(f) } }
-impl fmt::Display for Amount { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.0.fmt(f) } }
-impl fmt::Display for Bps    { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{}bps", self.0) } }
+impl fmt::Display for Price {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl fmt::Display for Size {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl fmt::Display for Amount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl fmt::Display for Bps {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}bps", self.0)
+    }
+}
 
 // Operator overloads. Same overflow semantics as primitive i64:
 // panic in debug builds, wrap in release. For untrusted input on hot paths,
 // use the explicit `checked_*` methods instead.
-impl Add        for Size   { type Output = Size;   #[inline] fn add(self, rhs: Self) -> Size   { Size(self.0 + rhs.0) } }
-impl Sub        for Size   { type Output = Size;   #[inline] fn sub(self, rhs: Self) -> Size   { Size(self.0 - rhs.0) } }
-impl AddAssign  for Size   { #[inline] fn add_assign(&mut self, rhs: Self) { self.0 += rhs.0; } }
-impl SubAssign  for Size   { #[inline] fn sub_assign(&mut self, rhs: Self) { self.0 -= rhs.0; } }
+impl Add for Size {
+    type Output = Size;
+    #[inline]
+    fn add(self, rhs: Self) -> Size {
+        Size(self.0 + rhs.0)
+    }
+}
+impl Sub for Size {
+    type Output = Size;
+    #[inline]
+    fn sub(self, rhs: Self) -> Size {
+        Size(self.0 - rhs.0)
+    }
+}
+impl AddAssign for Size {
+    #[inline]
+    fn add_assign(&mut self, rhs: Self) {
+        self.0 += rhs.0;
+    }
+}
+impl SubAssign for Size {
+    #[inline]
+    fn sub_assign(&mut self, rhs: Self) {
+        self.0 -= rhs.0;
+    }
+}
 
-impl Add        for Amount { type Output = Amount; #[inline] fn add(self, rhs: Self) -> Amount { Amount(self.0 + rhs.0) } }
-impl Sub        for Amount { type Output = Amount; #[inline] fn sub(self, rhs: Self) -> Amount { Amount(self.0 - rhs.0) } }
-impl AddAssign  for Amount { #[inline] fn add_assign(&mut self, rhs: Self) { self.0 += rhs.0; } }
-impl SubAssign  for Amount { #[inline] fn sub_assign(&mut self, rhs: Self) { self.0 -= rhs.0; } }
-impl Neg        for Amount { type Output = Amount; #[inline] fn neg(self) -> Amount { Amount(-self.0) } }
+impl Add for Amount {
+    type Output = Amount;
+    #[inline]
+    fn add(self, rhs: Self) -> Amount {
+        Amount(self.0 + rhs.0)
+    }
+}
+impl Sub for Amount {
+    type Output = Amount;
+    #[inline]
+    fn sub(self, rhs: Self) -> Amount {
+        Amount(self.0 - rhs.0)
+    }
+}
+impl AddAssign for Amount {
+    #[inline]
+    fn add_assign(&mut self, rhs: Self) {
+        self.0 += rhs.0;
+    }
+}
+impl SubAssign for Amount {
+    #[inline]
+    fn sub_assign(&mut self, rhs: Self) {
+        self.0 -= rhs.0;
+    }
+}
+impl Neg for Amount {
+    type Output = Amount;
+    #[inline]
+    fn neg(self) -> Amount {
+        Amount(-self.0)
+    }
+}
 
 #[cfg(test)]
 mod tests {

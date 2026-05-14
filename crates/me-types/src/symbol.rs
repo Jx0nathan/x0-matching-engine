@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::{ids::*, numeric::*};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolSpec {

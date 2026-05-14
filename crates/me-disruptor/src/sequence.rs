@@ -48,6 +48,8 @@ impl Default for Sequence {
 
 impl std::fmt::Debug for Sequence {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Sequence").field("value", &self.get()).finish()
+        f.debug_struct("Sequence")
+            .field("value", &self.get())
+            .finish()
     }
 }

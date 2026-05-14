@@ -4,7 +4,7 @@
 
 面向生产的撮合引擎，覆盖现货 + 永续/期货，使用 Rust 编写。
 
-> **当前状态：M5.4（保险基金）完成。** 新增 `INSURANCE_FUND = UserId(u64::MAX)` 系统账户。强平超出保证金的亏损（用户余额会变负）由保险基金吸收，用户余额归零；衍生品 OI 不对称时资金费率结算的净额也走保险基金（多头多付/少付的差额）。极端行情下保险基金本身可以变负（ADL/社会化损失留给 M5+）。M5.3 改单、M5.2 订单类型、M5.1 STP、M4 衍生品、M3 持久化全部保留。路线图详见 `CLAUDE.md`。
+> **当前状态：M5.5（Prometheus metrics + CI）完成。** `MatchingEngine::metrics_snapshot()` 直接渲染 Prometheus 文本格式（counters：commands / trades / liquidations / WAL fsyncs / stops triggered 等；gauges：last_applied_seq / 保险基金余额 / 交易所手续费收入 / 各 symbol 挂单深度 / 各币种 total_internal）。GitHub Actions CI 上 push 和 PR 跑 fmt + clippy -D warnings + 全量 test + release build + 1000-case 守恒属性测试。路线图详见 `CLAUDE.md`。
 
 ## 设计目标
 
