@@ -7,6 +7,10 @@ pub struct UserProfile {
     pub uid: UserId,
     pub accounts: AHashMap<Currency, i64>, // 运行时使用 AHashMap（性能更好）
     pub positions: AHashMap<SymbolId, SymbolPositionRecord>,
+    /// 最近一次已生效的出入金流水号。要求严格递增，用于幂等去重，
+    /// 使 WAL 重放和上游消息重投不会重复入账。O(1) 内存，无需保存全部历史 id。
+    #[serde(default)]
+    pub last_adjustment_id: i64,
 }
 
 impl UserProfile {
@@ -15,6 +19,7 @@ impl UserProfile {
             uid,
             accounts: AHashMap::new(),
             positions: AHashMap::new(),
+            last_adjustment_id: 0,
         }
     }
 }
@@ -88,18 +93,35 @@ impl UserProfileService {
         self.profiles.get_mut(&uid)
     }
 
+    /// 出入金调整。`transaction_id` 必须按用户严格递增，重复或过期的流水号会被忽略。
     pub fn balance_adjustment(
         &mut self,
         uid: UserId,
         currency: Currency,
         amount: i64,
-        _transaction_id: i64,
+        transaction_id: i64,
     ) -> CommandResultCode {
-        if let Some(profile) = self.profiles.get_mut(&uid) {
-            *profile.accounts.entry(currency).or_insert(0) += amount;
-            CommandResultCode::Success
-        } else {
-            CommandResultCode::AuthInvalidUser
+        let Some(profile) = self.profiles.get_mut(&uid) else {
+            return CommandResultCode::AuthInvalidUser;
+        };
+
+        // 幂等闸门：重放同一条流水不会二次入账
+        if transaction_id <= profile.last_adjustment_id {
+            return CommandResultCode::UserMgmtDuplicateTransaction;
         }
+
+        let current = profile.accounts.get(&currency).copied().unwrap_or(0);
+        let Some(new_balance) = current.checked_add(amount) else {
+            return CommandResultCode::RiskArithmeticOverflow;
+        };
+
+        // 出金不得把余额做成负数
+        if new_balance < 0 {
+            return CommandResultCode::RiskNsf;
+        }
+
+        profile.accounts.insert(currency, new_balance);
+        profile.last_adjustment_id = transaction_id;
+        CommandResultCode::Success
     }
 }

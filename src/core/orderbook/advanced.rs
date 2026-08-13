@@ -256,7 +256,11 @@ impl AdvancedOrderBook {
         // Post-Only 检查
         if cmd.order_type == OrderType::PostOnly {
             if self.check_post_only(cmd) != CommandResultCode::ValidForMatchingEngine {
-                cmd.matcher_events.push(MatcherTradeEvent::new_reject(cmd.size, cmd.price));
+                cmd.matcher_events.push(MatcherTradeEvent::new_reject(
+                    cmd.size,
+                    cmd.price,
+                    cmd.reserve_price,
+                ));
                 return;
             }
         }
@@ -291,7 +295,11 @@ impl AdvancedOrderBook {
         if self.order_map.contains_key(&cmd.order_id) {
             let filled = self.try_match(cmd);
             if filled < cmd.size {
-                cmd.matcher_events.push(MatcherTradeEvent::new_reject(cmd.size - filled, cmd.price));
+                cmd.matcher_events.push(MatcherTradeEvent::new_reject(
+                    cmd.size - filled,
+                    cmd.price,
+                    cmd.reserve_price,
+                ));
             }
             return;
         }
@@ -299,7 +307,11 @@ impl AdvancedOrderBook {
         // FOK: 全部成交或全部取消
         if cmd.order_type == OrderType::Fok {
             if !self.can_fill_completely(cmd) {
-                cmd.matcher_events.push(MatcherTradeEvent::new_reject(cmd.size, cmd.price));
+                cmd.matcher_events.push(MatcherTradeEvent::new_reject(
+                    cmd.size,
+                    cmd.price,
+                    cmd.reserve_price,
+                ));
                 return;
             }
         }
@@ -315,7 +327,11 @@ impl AdvancedOrderBook {
         // IOC/FOK: 不挂单
         if matches!(cmd.order_type, OrderType::Ioc | OrderType::Fok) {
             if filled < cmd.size {
-                cmd.matcher_events.push(MatcherTradeEvent::new_reject(cmd.size - filled, cmd.price));
+                cmd.matcher_events.push(MatcherTradeEvent::new_reject(
+                    cmd.size - filled,
+                    cmd.price,
+                    cmd.reserve_price,
+                ));
             }
             return;
         }
@@ -455,7 +471,8 @@ impl AdvancedOrderBook {
                 if let Some(order) = bucket.remove(cmd.order_id) {
                     cmd.matcher_events.push(MatcherTradeEvent::new_reject(
                         order.size - order.filled,
-                        price
+                        price,
+                        order.reserve_price,
                     ));
                     cmd.action = action;
 
@@ -472,7 +489,12 @@ impl AdvancedOrderBook {
         // 检查止损单池
         if let Some(pos) = self.stop_orders.iter().position(|o| o.order_id == cmd.order_id) {
             let order = self.stop_orders.remove(pos);
-            cmd.matcher_events.push(MatcherTradeEvent::new_reject(order.size, order.price));
+            cmd.matcher_events.push(MatcherTradeEvent::new_reject(
+                order.size - order.filled,
+                order.price,
+                order.reserve_price,
+            ));
+            cmd.action = order.action;
             return CommandResultCode::Success;
         }
 

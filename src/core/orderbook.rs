@@ -21,6 +21,10 @@ pub enum OrderBookState {
 }
 
 pub trait OrderBook: Send {
+    /// 下单。
+    ///
+    /// 契约：返回非 `Success` 时，订单簿状态不得被修改，也不得产生任何撮合事件——
+    /// 调用方据此补发全额 Reject 事件来退还 R1 已冻结的资金。
     fn new_order(&mut self, cmd: &mut OrderCommand) -> CommandResultCode;
     fn cancel_order(&mut self, cmd: &mut OrderCommand) -> CommandResultCode;
     fn move_order(&mut self, cmd: &mut OrderCommand) -> CommandResultCode;

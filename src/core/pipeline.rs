@@ -75,6 +75,16 @@ impl Pipeline {
         self.result_consumer = Some(consumer);
     }
 
+    /// 查询用户可用余额。每个 uid 只归属一个风控分片，其余分片返回 0。
+    pub fn balance_of(&self, uid: UserId, currency: Currency) -> i64 {
+        self.risk_engines.iter().map(|e| e.balance_of(uid, currency)).sum()
+    }
+
+    /// 已归集的手续费总额（对账用）
+    pub fn fees_collected(&self, currency: Currency) -> i64 {
+        self.risk_engines.iter().map(|e| e.fees_collected(currency)).sum()
+    }
+
     pub fn add_symbol(&mut self, spec: CoreSymbolSpecification) {
         for engine in &mut self.risk_engines {
             engine.add_symbol(spec.clone());

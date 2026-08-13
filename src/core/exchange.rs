@@ -176,6 +176,16 @@ impl ExchangeCore {
         }
     }
 
+    /// 查询用户可用余额。`startup()` 之后 pipeline 移交给 Disruptor 线程，返回 None。
+    pub fn balance_of(&self, uid: UserId, currency: Currency) -> Option<i64> {
+        self.pipeline.as_ref().map(|p| p.balance_of(uid, currency))
+    }
+
+    /// 查询已归集的手续费。`startup()` 之后返回 None。
+    pub fn fees_collected(&self, currency: Currency) -> Option<i64> {
+        self.pipeline.as_ref().map(|p| p.fees_collected(currency))
+    }
+
     /// 提交命令
     pub fn submit_command(&mut self, mut cmd: OrderCommand) -> OrderCommand {
         if let Some(j) = &mut self.journaler {

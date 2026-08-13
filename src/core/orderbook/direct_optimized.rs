@@ -139,7 +139,11 @@ impl DirectOrderBookOptimized {
                 self.try_match(cmd)
             };
             if filled < cmd.size {
-                cmd.matcher_events.push(MatcherTradeEvent::new_reject(cmd.size - filled, cmd.price));
+                cmd.matcher_events.push(MatcherTradeEvent::new_reject(
+                    cmd.size - filled,
+                    cmd.price,
+                    cmd.reserve_price,
+                ));
             }
             return;
         }
@@ -181,7 +185,11 @@ impl DirectOrderBookOptimized {
             self.try_match(cmd)
         };
         if filled < cmd.size {
-            cmd.matcher_events.push(MatcherTradeEvent::new_reject(cmd.size - filled, cmd.price));
+            cmd.matcher_events.push(MatcherTradeEvent::new_reject(
+                cmd.size - filled,
+                cmd.price,
+                cmd.reserve_price,
+            ));
         }
     }
 
@@ -597,8 +605,9 @@ impl DirectOrderBookOptimized {
             let price = self.order_pool.hot.prices[order_idx];
             let action = self.order_pool.cold[order_idx].action;
             let remaining = self.order_pool.hot.sizes[order_idx] - self.order_pool.hot.filled[order_idx];
+            let reserve_price = self.order_pool.cold[order_idx].reserve_price;
 
-            cmd.matcher_events.push(MatcherTradeEvent::new_reject(remaining, price));
+            cmd.matcher_events.push(MatcherTradeEvent::new_reject(remaining, price, reserve_price));
             cmd.action = action;
 
             self.order_index.remove(&cmd.order_id);

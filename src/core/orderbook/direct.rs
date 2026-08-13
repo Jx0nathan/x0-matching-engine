@@ -74,7 +74,11 @@ impl DirectOrderBook {
         if self.order_id_index.contains_key(&cmd.order_id) {
             let filled = self.try_match(cmd);
             if filled < cmd.size {
-                cmd.matcher_events.push(MatcherTradeEvent::new_reject(cmd.size - filled, cmd.price));
+                cmd.matcher_events.push(MatcherTradeEvent::new_reject(
+                    cmd.size - filled,
+                    cmd.price,
+                    cmd.reserve_price,
+                ));
             }
             return;
         }
@@ -109,7 +113,11 @@ impl DirectOrderBook {
         let rejected = cmd.size - filled;
 
         if rejected > 0 {
-            cmd.matcher_events.push(MatcherTradeEvent::new_reject(rejected, cmd.price));
+            cmd.matcher_events.push(MatcherTradeEvent::new_reject(
+                rejected,
+                cmd.price,
+                cmd.reserve_price,
+            ));
         }
     }
 
@@ -121,10 +129,18 @@ impl DirectOrderBook {
             if self.is_budget_satisfied(cmd.action, calculated, cmd.price) {
                 self.try_match(cmd);
             } else {
-                cmd.matcher_events.push(MatcherTradeEvent::new_reject(cmd.size, cmd.price));
+                cmd.matcher_events.push(MatcherTradeEvent::new_reject(
+                    cmd.size,
+                    cmd.price,
+                    cmd.reserve_price,
+                ));
             }
         } else {
-            cmd.matcher_events.push(MatcherTradeEvent::new_reject(cmd.size, cmd.price));
+            cmd.matcher_events.push(MatcherTradeEvent::new_reject(
+                cmd.size,
+                cmd.price,
+                cmd.reserve_price,
+            ));
         }
     }
 
@@ -430,12 +446,12 @@ impl super::OrderBook for DirectOrderBook {
             return CommandResultCode::MatchingUnknownOrderId;
         };
 
-        let (action, remaining, price) = {
+        let (action, remaining, price, reserve_price) = {
             let order = &self.orders[order_idx];
             if order.uid != cmd.uid {
                 return CommandResultCode::MatchingUnknownOrderId;
             }
-            (order.action, order.size - order.filled, order.price)
+            (order.action, order.size - order.filled, order.price, order.reserve_price)
         };
 
         self.order_id_index.remove(&cmd.order_id);
@@ -443,7 +459,7 @@ impl super::OrderBook for DirectOrderBook {
         self.orders.remove(order_idx);
 
         cmd.action = action;
-        cmd.matcher_events.push(MatcherTradeEvent::new_reject(remaining, price));
+        cmd.matcher_events.push(MatcherTradeEvent::new_reject(remaining, price, reserve_price));
 
         CommandResultCode::Success
     }
@@ -453,12 +469,22 @@ impl super::OrderBook for DirectOrderBook {
             return CommandResultCode::MatchingUnknownOrderId;
         };
 
-        let (uid, action, reserve_price, size) = {
+        if cmd.price <= 0 {
+            return CommandResultCode::RiskInvalidOrderParams;
+        }
+
+        let (uid, action, reserve_price, size, filled_before) = {
             let order = &self.orders[order_idx];
             if order.uid != cmd.uid {
                 return CommandResultCode::MatchingUnknownOrderId;
             }
-            (order.uid, order.action, order.reserve_price, order.size)
+            (
+                order.uid,
+                order.action,
+                order.reserve_price,
+                order.size,
+                order.filled,
+            )
         };
 
         // 风险检查
@@ -476,28 +502,32 @@ impl super::OrderBook for DirectOrderBook {
         self.orders[order_idx].price = cmd.price;
         cmd.action = action;
 
-        // 尝试撮合
+        // 尝试撮合。只能拿"剩余未成交量"去撮合：
+        // 用原始 size 会把已成交部分再成交一遍，凭空造出多余成交量。
         let mut temp_cmd = OrderCommand {
             uid,
             order_id: cmd.order_id,
             symbol: cmd.symbol,
             price: cmd.price,
-            size,
+            size: size - filled_before,
             action,
             reserve_price,
             ..Default::default()
         };
 
-        let filled = self.try_match(&mut temp_cmd);
+        let newly_filled = self.try_match(&mut temp_cmd);
         cmd.matcher_events.extend(temp_cmd.matcher_events);
 
-        if filled == self.orders[order_idx].size {
+        // 累加而非覆盖，否则改价会抹掉此前的成交记录
+        let total_filled = filled_before + newly_filled;
+        self.orders[order_idx].filled = total_filled;
+
+        if total_filled >= size {
             // 完全成交
             self.order_id_index.remove(&cmd.order_id);
             self.orders.remove(order_idx);
         } else {
             // 部分成交，重新挂单
-            self.orders[order_idx].filled = filled;
             self.insert_order(order_idx);
         }
 
@@ -513,12 +543,12 @@ impl super::OrderBook for DirectOrderBook {
             return CommandResultCode::MatchingInvalidOrderSize;
         }
 
-        let (action, remaining, price, parent_idx) = {
+        let (action, remaining, price, parent_idx, reserve_price) = {
             let order = &self.orders[order_idx];
             if order.uid != cmd.uid {
                 return CommandResultCode::MatchingUnknownOrderId;
             }
-            (order.action, order.size - order.filled, order.price, order.parent)
+            (order.action, order.size - order.filled, order.price, order.parent, order.reserve_price)
         };
 
         let reduce_by = remaining.min(cmd.size);
@@ -535,7 +565,7 @@ impl super::OrderBook for DirectOrderBook {
         }
 
         cmd.action = action;
-        cmd.matcher_events.push(MatcherTradeEvent::new_reject(reduce_by, price));
+        cmd.matcher_events.push(MatcherTradeEvent::new_reject(reduce_by, price, reserve_price));
 
         CommandResultCode::Success
     }

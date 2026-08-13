@@ -135,7 +135,11 @@ impl NaiveOrderBook {
         if self.order_map.contains_key(&cmd.order_id) {
             let filled = self.try_match(cmd);
             if filled < cmd.size {
-                cmd.matcher_events.push(MatcherTradeEvent::new_reject(cmd.size - filled, cmd.price));
+                cmd.matcher_events.push(MatcherTradeEvent::new_reject(
+                    cmd.size - filled,
+                    cmd.price,
+                    cmd.reserve_price,
+                ));
             }
             return;
         }
@@ -188,7 +192,11 @@ impl NaiveOrderBook {
         let rejected = cmd.size - filled;
 
         if rejected > 0 {
-            cmd.matcher_events.push(MatcherTradeEvent::new_reject(rejected, cmd.price));
+            cmd.matcher_events.push(MatcherTradeEvent::new_reject(
+                rejected,
+                cmd.price,
+                cmd.reserve_price,
+            ));
         }
     }
 
@@ -202,11 +210,19 @@ impl NaiveOrderBook {
             if self.is_budget_satisfied(cmd.action, calculated_budget, cmd.price) {
                 self.try_match(cmd);
             } else {
-                cmd.matcher_events.push(MatcherTradeEvent::new_reject(cmd.size, cmd.price));
+                cmd.matcher_events.push(MatcherTradeEvent::new_reject(
+                    cmd.size,
+                    cmd.price,
+                    cmd.reserve_price,
+                ));
             }
         } else {
             // 流动性不足
-            cmd.matcher_events.push(MatcherTradeEvent::new_reject(cmd.size, cmd.price));
+            cmd.matcher_events.push(MatcherTradeEvent::new_reject(
+                cmd.size,
+                cmd.price,
+                cmd.reserve_price,
+            ));
         }
     }
 
@@ -353,7 +369,11 @@ impl super::OrderBook for NaiveOrderBook {
 
         if let Some(bucket) = buckets.get_mut(&price) {
             if let Some(order) = bucket.remove(cmd.order_id) {
-                cmd.matcher_events.push(MatcherTradeEvent::new_reject(order.remaining(), price));
+                cmd.matcher_events.push(MatcherTradeEvent::new_reject(
+                    order.remaining(),
+                    price,
+                    order.reserve_price,
+                ));
                 cmd.action = action;
 
                 if bucket.total_volume == 0 {
@@ -467,11 +487,12 @@ impl super::OrderBook for NaiveOrderBook {
             if let Some(order) = bucket.orders.iter_mut().find(|o| o.order_id == cmd.order_id) {
                 let remaining = order.remaining();
                 let reduce_by = remaining.min(cmd.size);
+                let reserve_price = order.reserve_price;
 
                 if reduce_by == remaining {
                     // 完全移除
                     let _order = bucket.remove(cmd.order_id).unwrap();
-                    cmd.matcher_events.push(MatcherTradeEvent::new_reject(reduce_by, price));
+                    cmd.matcher_events.push(MatcherTradeEvent::new_reject(reduce_by, price, reserve_price));
                     cmd.action = action;
                     self.order_map.remove(&cmd.order_id);
 
@@ -483,7 +504,7 @@ impl super::OrderBook for NaiveOrderBook {
                     // 部分减少
                     order.size -= reduce_by;
                     bucket.total_volume -= reduce_by;
-                    cmd.matcher_events.push(MatcherTradeEvent::new_reject(reduce_by, price));
+                    cmd.matcher_events.push(MatcherTradeEvent::new_reject(reduce_by, price, reserve_price));
                     cmd.action = action;
                 }
 

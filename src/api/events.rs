@@ -56,14 +56,18 @@ impl MatcherTradeEvent {
         }
     }
 
-    pub fn new_reject(size: Size, price: Price) -> Self {
+    /// 构造拒绝/撤销事件。
+    ///
+    /// `bidder_hold_price` 必须是下单时实际冻结资金所用的价格（买单的 reserve_price），
+    /// R2 结算依赖它计算退款金额；传 0 会导致买单冻结的资金无法归还。
+    pub fn new_reject(size: Size, price: Price, bidder_hold_price: Price) -> Self {
         Self {
             event_type: MatcherEventType::Reject,
             size,
             price,
             matched_order_id: 0,
             matched_order_uid: 0,
-            bidder_hold_price: 0,
+            bidder_hold_price,
         }
     }
 }

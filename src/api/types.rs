@@ -70,6 +70,10 @@ pub enum CommandResultCode {
     RiskInvalidReserveBidPrice,
     RiskAskPriceLowerThanFee,
     RiskMarginTradingDisabled,
+    /// size / price 非正数等非法入参（负数 size 会让冻结额变成负数）
+    RiskInvalidOrderParams,
+    /// 金额计算溢出 i64，订单被拒绝而非静默回绕
+    RiskArithmeticOverflow,
     
     // Matching
     MatchingInvalidOrderBookId,
@@ -85,6 +89,8 @@ pub enum CommandResultCode {
     
     // User
     UserMgmtUserAlreadyExists,
+    /// 该 transaction_id 已被处理过（WAL 重放 / 消息重投），本次调整被忽略
+    UserMgmtDuplicateTransaction,
     
     // Other
     InvalidSymbol,

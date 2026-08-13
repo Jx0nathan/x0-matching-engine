@@ -94,8 +94,23 @@ impl MatchingEngineRouter {
         match cmd.command {
             OrderCommandType::PlaceOrder => {
                 if cmd.result_code == CommandResultCode::ValidForMatchingEngine {
-                    book.new_order(cmd);
-                    cmd.result_code = CommandResultCode::Success;
+                    let code = book.new_order(cmd);
+                    if code == CommandResultCode::Success {
+                        cmd.result_code = CommandResultCode::Success;
+                    } else {
+                        // R1 已经冻结了资金。撮合层拒绝该订单（如不支持的订单类型）时
+                        // 必须补一条全额 Reject 事件，否则 R2 不会退款，用户资金被永久冻结。
+                        debug_assert!(
+                            cmd.matcher_events.is_empty(),
+                            "new_order 返回失败码时不应产生撮合事件"
+                        );
+                        cmd.matcher_events.push(MatcherTradeEvent::new_reject(
+                            cmd.size,
+                            cmd.price,
+                            cmd.reserve_price,
+                        ));
+                        cmd.result_code = code;
+                    }
                 }
             }
             OrderCommandType::CancelOrder => {
