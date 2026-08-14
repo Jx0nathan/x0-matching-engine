@@ -82,6 +82,8 @@ pub enum CommandResultCode {
     MatchingMoveFailedPriceOverRiskLimit,
     MatchingReduceFailedWrongSize,
     MatchingInvalidOrderSize,
+    /// order_id 已存在于订单簿中，重复下单被拒绝（不会撮合、不会入簿）
+    MatchingDuplicateOrderId,
     
     // State
     StatePersistRiskEngineFailed,

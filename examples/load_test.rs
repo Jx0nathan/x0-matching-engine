@@ -44,7 +44,7 @@ fn run_load_test(name: &str, config: &LoadTestConfig) {
     
     core.set_result_consumer(Arc::new(move |_cmd| {
         count_clone.fetch_add(1, Ordering::SeqCst);
-    }));
+    })).expect("注册结果回调失败");
 
     // 初始化交易对 (启动前进行以便同步地设置到 Pipeline)
     core.add_symbol(CoreSymbolSpecification {
@@ -57,7 +57,7 @@ fn run_load_test(name: &str, config: &LoadTestConfig) {
         taker_fee: 10,
         maker_fee: 5,
         ..Default::default()
-    });
+    }).expect("注册交易对失败");
 
     // 启动异步流水线
     core.startup();

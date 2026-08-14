@@ -68,21 +68,8 @@ impl DirectOrderBook {
         }
     }
 
-    /// GTC 下单
+    /// GTC 下单。调用方须先确认 order_id 未被占用。
     fn place_gtc(&mut self, cmd: &mut OrderCommand) {
-        // 检查重复订单
-        if self.order_id_index.contains_key(&cmd.order_id) {
-            let filled = self.try_match(cmd);
-            if filled < cmd.size {
-                cmd.matcher_events.push(MatcherTradeEvent::new_reject(
-                    cmd.size - filled,
-                    cmd.price,
-                    cmd.reserve_price,
-                ));
-            }
-            return;
-        }
-
         // 尝试撮合
         let filled = self.try_match(cmd);
 
@@ -422,6 +409,12 @@ impl DirectOrderBook {
 
 impl super::OrderBook for DirectOrderBook {
     fn new_order(&mut self, cmd: &mut OrderCommand) -> CommandResultCode {
+        // 重复 order_id 一律拒绝。早先的做法是拿重复命令去撮合再拒绝剩余量，
+        // 既可能产生非预期成交，又会让调用方收到"成功"。
+        if self.order_id_index.contains_key(&cmd.order_id) {
+            return CommandResultCode::MatchingDuplicateOrderId;
+        }
+
         match cmd.order_type {
             OrderType::Gtc => {
                 self.place_gtc(cmd);

@@ -37,7 +37,8 @@ impl Harness {
             maker_fee: MAKER_FEE,
             margin_buy: 0,
             margin_sell: 0,
-        });
+        })
+        .expect("注册交易对失败");
         Self {
             core,
             next_tx_id: std::collections::HashMap::new(),

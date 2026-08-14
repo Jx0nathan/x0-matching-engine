@@ -129,21 +129,8 @@ impl NaiveOrderBook {
         self.best_bid_price = self.bid_buckets.keys().next_back().copied();
     }
 
-    /// GTC 下单
+    /// GTC 下单。调用方须先确认 order_id 未被占用。
     fn place_gtc(&mut self, cmd: &mut OrderCommand) {
-        // 检查重复订单 ID
-        if self.order_map.contains_key(&cmd.order_id) {
-            let filled = self.try_match(cmd);
-            if filled < cmd.size {
-                cmd.matcher_events.push(MatcherTradeEvent::new_reject(
-                    cmd.size - filled,
-                    cmd.price,
-                    cmd.reserve_price,
-                ));
-            }
-            return;
-        }
-
         // 1. 尝试立即撮合
         let filled = self.try_match(cmd);
 
@@ -340,6 +327,10 @@ impl NaiveOrderBook {
 
 impl super::OrderBook for NaiveOrderBook {
     fn new_order(&mut self, cmd: &mut OrderCommand) -> CommandResultCode {
+        if self.order_map.contains_key(&cmd.order_id) {
+            return CommandResultCode::MatchingDuplicateOrderId;
+        }
+
         match cmd.order_type {
             OrderType::Gtc => {
                 self.place_gtc(cmd);

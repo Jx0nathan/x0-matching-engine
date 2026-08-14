@@ -8,7 +8,7 @@ fn main() {
 
     core.set_result_consumer(Arc::new(|cmd| {
         println!("结果: {:?} - {:?}", cmd.command, cmd.result_code);
-    }));
+    })).expect("注册结果回调失败");
 
     // 添加交易对
     core.add_symbol(CoreSymbolSpecification {
@@ -22,7 +22,7 @@ fn main() {
         maker_fee: 5,
         margin_buy: 0,
         margin_sell: 0,
-    });
+    }).expect("注册交易对失败");
 
     // 添加用户
     core.submit_command(OrderCommand {
@@ -162,7 +162,7 @@ fn main() {
     println!("  减少订单结果: {:?}", reduce_result.result_code);
     // 6. 测试序列化与快照
     println!("\n=== 测试二进制序列化 (Bincode) ===\n");
-    let state = core.serialize_state();
+    let state = core.serialize_state().expect("序列化状态失败");
     let serialized = bincode::serialize(&state).expect("序列化失败");
     println!("序列化成功，字节大小: {}", serialized.len());
 
@@ -175,7 +175,7 @@ fn main() {
     // 在恢复的核心上继续测试
     core2.set_result_consumer(Arc::new(|cmd| {
         println!("恢复核心结果: {:?} - {:?}", cmd.command, cmd.result_code);
-    }));
+    })).expect("注册结果回调失败");
 
     println!("在恢复的核心上提交新订单:");
     core2.submit_command(OrderCommand {
@@ -209,7 +209,7 @@ fn main() {
         taker_fee: 10,
         maker_fee: 5,
         ..Default::default()
-    });
+    }).expect("注册交易对失败");
     
     core_wal.enable_journaling(journal_path).expect("启用 WAL 失败");
     
@@ -239,7 +239,7 @@ fn main() {
         taker_fee: 10,
         maker_fee: 5,
         ..Default::default()
-    });
+    }).expect("注册交易对失败");
 
     core_recovered.replay_journal(journal_path).expect("重放 WAL 失败");
     println!("WAL 恢复成功");
@@ -267,7 +267,7 @@ fn main() {
         taker_fee: 10,
         maker_fee: 5,
         ..Default::default()
-    });
+    }).expect("注册交易对失败");
 
     println!("生成快照 (ID: 1)...");
     core_snap.take_snapshot(1).expect("生成快照失败");

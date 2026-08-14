@@ -289,21 +289,8 @@ impl AdvancedOrderBook {
         self.place_order_internal(cmd);
     }
 
-    /// 内部下单逻辑
+    /// 内部下单逻辑。调用方须先确认 order_id 未被占用。
     fn place_order_internal(&mut self, cmd: &mut OrderCommand) {
-        // 检查重复订单
-        if self.order_map.contains_key(&cmd.order_id) {
-            let filled = self.try_match(cmd);
-            if filled < cmd.size {
-                cmd.matcher_events.push(MatcherTradeEvent::new_reject(
-                    cmd.size - filled,
-                    cmd.price,
-                    cmd.reserve_price,
-                ));
-            }
-            return;
-        }
-
         // FOK: 全部成交或全部取消
         if cmd.order_type == OrderType::Fok {
             if !self.can_fill_completely(cmd) {
@@ -504,6 +491,13 @@ impl AdvancedOrderBook {
 
 impl super::OrderBook for AdvancedOrderBook {
     fn new_order(&mut self, cmd: &mut OrderCommand) -> CommandResultCode {
+        // 活跃簿与止损单池都要查重
+        if self.order_map.contains_key(&cmd.order_id)
+            || self.stop_orders.iter().any(|o| o.order_id == cmd.order_id)
+        {
+            return CommandResultCode::MatchingDuplicateOrderId;
+        }
+
         self.place_order(cmd);
         CommandResultCode::Success
     }

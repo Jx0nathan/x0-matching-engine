@@ -14,7 +14,7 @@ pub fn test_full_flow() {
         base_scale_k: 100,
         quote_scale_k: 1,
         ..Default::default()
-    });
+    }).expect("注册交易对失败");
 
     core.submit_command(OrderCommand {
         command: OrderCommandType::AddUser,

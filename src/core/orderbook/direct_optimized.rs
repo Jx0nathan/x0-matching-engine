@@ -130,24 +130,8 @@ impl DirectOrderBookOptimized {
         self.use_simd = enabled;
     }
 
-    /// GTC 下单
+    /// GTC 下单。调用方须先确认 order_id 未被占用。
     fn place_gtc(&mut self, cmd: &mut OrderCommand) {
-        if self.order_index.contains_key(&cmd.order_id) {
-            let filled = if self.use_simd {
-                self.try_match_simd_batch(cmd)
-            } else {
-                self.try_match(cmd)
-            };
-            if filled < cmd.size {
-                cmd.matcher_events.push(MatcherTradeEvent::new_reject(
-                    cmd.size - filled,
-                    cmd.price,
-                    cmd.reserve_price,
-                ));
-            }
-            return;
-        }
-
         let filled = if self.use_simd {
             self.try_match_simd_batch(cmd)
         } else {
@@ -622,6 +606,10 @@ impl DirectOrderBookOptimized {
 
 impl super::OrderBook for DirectOrderBookOptimized {
     fn new_order(&mut self, cmd: &mut OrderCommand) -> CommandResultCode {
+        if self.order_index.contains_key(&cmd.order_id) {
+            return CommandResultCode::MatchingDuplicateOrderId;
+        }
+
         match cmd.order_type {
             OrderType::Gtc => {
                 self.place_gtc(cmd);
