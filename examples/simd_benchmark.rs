@@ -4,6 +4,7 @@ use std::time::Instant;
 
 fn create_symbol_spec() -> CoreSymbolSpecification {
     CoreSymbolSpecification {
+        stp: SelfTradePrevention::None,
         symbol_id: 1,
         symbol_type: SymbolType::CurrencyExchangePair,
         base_currency: 0,

@@ -42,6 +42,27 @@ pub enum OrderType {
     Gtd(i64),         // Good-Till-Date (时间戳)
 }
 
+/// 自成交防范策略（Self-Trade Prevention）。
+///
+/// 同一用户的买卖单互相成交属于洗盘交易，多数司法辖区不允许。
+/// 按交易对配置，在撮合时生效。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
+pub enum SelfTradePrevention {
+    /// 不做任何防范，允许自成交。仅用于测试或明确不需要的场景。
+    None,
+    /// 撤销新来的订单（taker），保留簿中已有挂单。语义最严格。
+    CancelTaker,
+    /// 撤销簿中自己的挂单（maker），新单继续与其他对手撮合。
+    CancelMaker,
+    /// 双方都撤销。
+    CancelBoth,
+    /// 跳过自己的挂单，继续与更差价位的他人订单撮合，双方订单都保留。
+    /// 对用户最无感，且不损耗市场深度。
+    Skip,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
@@ -114,6 +135,14 @@ pub struct CoreSymbolSpecification {
     pub maker_fee: i64,
     pub margin_buy: i64,
     pub margin_sell: i64,
+    /// 自成交防范策略。默认 `CancelTaker`——合规要求上线必须启用某种策略，
+    /// 因此默认取安全值；确实需要允许自成交时显式设为 `None`。
+    #[serde(default = "default_stp")]
+    pub stp: SelfTradePrevention,
+}
+
+fn default_stp() -> SelfTradePrevention {
+    SelfTradePrevention::CancelTaker
 }
 
 impl Default for CoreSymbolSpecification {
@@ -129,6 +158,7 @@ impl Default for CoreSymbolSpecification {
             maker_fee: 0,
             margin_buy: 0,
             margin_sell: 0,
+            stp: SelfTradePrevention::CancelTaker,
         }
     }
 }

@@ -3,6 +3,7 @@ use matching_core::core::orderbook::{OrderBook, AdvancedOrderBook};
 
 fn create_symbol_spec() -> CoreSymbolSpecification {
     CoreSymbolSpecification {
+        stp: SelfTradePrevention::None,
         symbol_id: 1,
         symbol_type: SymbolType::CurrencyExchangePair,
         base_currency: 0,
@@ -454,6 +455,7 @@ fn test_all_symbol_types() {
     
     for (i, symbol_type) in types.iter().enumerate() {
         let spec = CoreSymbolSpecification {
+            stp: SelfTradePrevention::None,
             symbol_id: i as i32,
             symbol_type: *symbol_type,
             base_currency: 0,

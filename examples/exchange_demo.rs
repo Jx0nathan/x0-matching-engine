@@ -12,6 +12,7 @@ fn main() {
 
     // 添加交易对
     core.add_symbol(CoreSymbolSpecification {
+        stp: SelfTradePrevention::None,
         symbol_id: 100,
         symbol_type: SymbolType::CurrencyExchangePair,
         base_currency: 2,

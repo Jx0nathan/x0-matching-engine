@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 fn spec(symbol_id: SymbolId) -> CoreSymbolSpecification {
     CoreSymbolSpecification {
+        stp: SelfTradePrevention::None,
         symbol_id,
         symbol_type: SymbolType::CurrencyExchangePair,
         base_currency: 0,

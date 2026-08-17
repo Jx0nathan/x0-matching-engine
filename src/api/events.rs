@@ -10,6 +10,9 @@ pub enum MatcherEventType {
     Trade,      // 成交
     Reject,     // 拒绝
     Reduce,     // 减少
+    /// STP 撤销簿中的挂单（maker 侧）。释放的冻结资金属于**命令的对手方向**，
+    /// 结算时必须退对应的另一种币，不能沿用命令方向。
+    RejectMaker,
 }
 
 /// 撮合事件
@@ -67,6 +70,24 @@ impl MatcherTradeEvent {
             price,
             matched_order_id: 0,
             matched_order_uid: 0,
+            bidder_hold_price,
+        }
+    }
+
+    /// STP 撤销簿中挂单时使用。与 `new_reject` 的区别在于退款方向取对手方。
+    pub fn new_reject_maker(
+        size: Size,
+        price: Price,
+        bidder_hold_price: Price,
+        maker_order_id: OrderId,
+        maker_uid: UserId,
+    ) -> Self {
+        Self {
+            event_type: MatcherEventType::RejectMaker,
+            size,
+            price,
+            matched_order_id: maker_order_id,
+            matched_order_uid: maker_uid,
             bidder_hold_price,
         }
     }

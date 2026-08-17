@@ -6,6 +6,7 @@ fn main() {
 
     // 创建现货交易对
     let spot_spec = CoreSymbolSpecification {
+        stp: SelfTradePrevention::None,
         symbol_id: 1,
         symbol_type: SymbolType::CurrencyExchangePair,
         base_currency: 0,
@@ -128,6 +129,7 @@ fn main() {
     // 6. 永续合约
     println!("6. 永续合约（Perpetual Swap）");
     let perp_spec = CoreSymbolSpecification {
+        stp: SelfTradePrevention::None,
         symbol_id: 2,
         symbol_type: SymbolType::PerpetualSwap,
         base_currency: 0,
@@ -173,6 +175,7 @@ fn main() {
     // 7. 期权
     println!("7. 期权（Options）");
     let call_spec = CoreSymbolSpecification {
+        stp: SelfTradePrevention::None,
         symbol_id: 3,
         symbol_type: SymbolType::CallOption,
         base_currency: 0,

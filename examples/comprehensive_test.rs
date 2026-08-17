@@ -4,6 +4,7 @@ use std::time::Instant;
 
 fn create_symbol_spec() -> CoreSymbolSpecification {
     CoreSymbolSpecification {
+        stp: SelfTradePrevention::None,
         symbol_id: 1,
         symbol_type: SymbolType::CurrencyExchangePair,
         base_currency: 0,
@@ -130,6 +131,7 @@ fn test_multiple_symbol_types() {
     
     for (symbol_type, name) in types {
         let spec = CoreSymbolSpecification {
+            stp: SelfTradePrevention::None,
             symbol_id: 1,
             symbol_type,
             base_currency: 0,

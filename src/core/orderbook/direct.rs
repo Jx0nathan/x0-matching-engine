@@ -7,6 +7,23 @@ use serde::{Deserialize, Serialize};
 type OrderIdx = usize;
 type BucketIdx = usize;
 
+/// 一次撮合尝试的结果
+struct MatchResult {
+    /// 本次成交量
+    filled: Size,
+    /// STP 判定新单必须整单撤销：剩余量不得挂入簿中，需退还冻结资金
+    taker_aborted: bool,
+}
+
+impl MatchResult {
+    fn filled(filled: Size) -> Self {
+        Self {
+            filled,
+            taker_aborted: false,
+        }
+    }
+}
+
 /// 直接订单（使用 Slab 索引实现的双向链表，避免 Rc/RefCell 开销）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DirectOrder {
@@ -71,7 +88,22 @@ impl DirectOrderBook {
     /// GTC 下单。调用方须先确认 order_id 未被占用。
     fn place_gtc(&mut self, cmd: &mut OrderCommand) {
         // 尝试撮合
-        let filled = self.try_match(cmd);
+        let MatchResult {
+            filled,
+            taker_aborted,
+        } = self.try_match(cmd);
+
+        // STP 判定撤销新单：剩余量不挂簿，直接退还冻结资金
+        if taker_aborted {
+            if filled < cmd.size {
+                cmd.matcher_events.push(MatcherTradeEvent::new_reject(
+                    cmd.size - filled,
+                    cmd.price,
+                    cmd.reserve_price,
+                ));
+            }
+            return;
+        }
 
         // 未完全成交，挂单
         if filled < cmd.size {
@@ -96,7 +128,7 @@ impl DirectOrderBook {
 
     /// IOC 下单
     fn place_ioc(&mut self, cmd: &mut OrderCommand) {
-        let filled = self.try_match(cmd);
+        let filled = self.try_match(cmd).filled;
         let rejected = cmd.size - filled;
 
         if rejected > 0 {
@@ -114,7 +146,18 @@ impl DirectOrderBook {
 
         if let Some(calculated) = budget {
             if self.is_budget_satisfied(cmd.action, calculated, cmd.price) {
-                self.try_match(cmd);
+                let MatchResult {
+                    filled,
+                    taker_aborted,
+                } = self.try_match(cmd);
+                // FOK 语义要求全成或全撤；STP 中断或未能全额成交时退还未成交部分
+                if taker_aborted && filled < cmd.size {
+                    cmd.matcher_events.push(MatcherTradeEvent::new_reject(
+                        cmd.size - filled,
+                        cmd.price,
+                        cmd.reserve_price,
+                    ));
+                }
             } else {
                 cmd.matcher_events.push(MatcherTradeEvent::new_reject(
                     cmd.size,
@@ -164,7 +207,7 @@ impl DirectOrderBook {
     }
 
     /// 尝试撮合
-    fn try_match(&mut self, cmd: &mut OrderCommand) -> Size {
+    fn try_match(&mut self, cmd: &mut OrderCommand) -> MatchResult {
         let is_bid = cmd.action == OrderAction::Bid;
         let limit_price = cmd.price;
 
@@ -178,18 +221,25 @@ impl DirectOrderBook {
         if let Some(idx) = maker_idx {
             let maker_price = self.orders[idx].price;
             if is_bid && maker_price > limit_price {
-                return 0;
+                return MatchResult::filled(0);
             }
             if !is_bid && maker_price < limit_price {
-                return 0;
+                return MatchResult::filled(0);
             }
         } else {
-            return 0;
+            return MatchResult::filled(0);
         }
 
         let mut filled = 0;
+        let mut taker_aborted = false;
         let taker_size = cmd.size;
         let taker_reserve = cmd.reserve_price;
+        let stp = self.symbol_spec.stp;
+
+        // 最优价指针只能推进到"队首被连续移除"的位置。STP 跳过或保留任何一单后，
+        // 它就必须停在那一单上，否则被保留的订单会脱离最优价链而变得不可达。
+        let mut new_best = maker_idx;
+        let mut front_intact = true;
 
         while let Some(idx) = maker_idx {
             let remaining = taker_size - filled;
@@ -208,6 +258,47 @@ impl DirectOrderBook {
                 (order.price, order.filled, order.size, order.parent, order.prev)
             };
 
+            // ---- 自成交防范 ----
+            if self.orders[idx].uid == cmd.uid && stp != SelfTradePrevention::None {
+                let (cancel_maker, abort_taker) = match stp {
+                    SelfTradePrevention::CancelTaker => (false, true),
+                    SelfTradePrevention::CancelMaker => (true, false),
+                    SelfTradePrevention::CancelBoth => (true, true),
+                    SelfTradePrevention::Skip => (false, false),
+                    SelfTradePrevention::None => unreachable!(),
+                };
+
+                if cancel_maker {
+                    // 释放该挂单剩余量的冻结资金：方向是 taker 的对手方
+                    let maker_remaining = maker_size - maker_filled;
+                    cmd.matcher_events.push(MatcherTradeEvent::new_reject_maker(
+                        maker_remaining,
+                        maker_price,
+                        self.orders[idx].reserve_price,
+                        self.orders[idx].order_id,
+                        self.orders[idx].uid,
+                    ));
+                    self.order_id_index.remove(&self.orders[idx].order_id);
+                    self.remove_order(idx);
+                    self.orders.remove(idx);
+                    if front_intact {
+                        new_best = maker_prev;
+                    }
+                } else {
+                    // 这一单被保留下来，最优价指针不能再越过它
+                    front_intact = false;
+                }
+
+                if abort_taker {
+                    taker_aborted = true;
+                    break;
+                }
+
+                // Skip / CancelMaker：跳过这一单，继续向后撮合
+                maker_idx = maker_prev;
+                continue;
+            }
+
             let trade_size = remaining.min(maker_size - maker_filled);
 
             // 更新 maker 订单
@@ -221,9 +312,6 @@ impl DirectOrderBook {
             filled += trade_size;
 
             let maker_completed = maker_filled + trade_size == maker_size;
-            if maker_completed {
-                self.buckets[maker_parent].num_orders -= 1;
-            }
 
             // 生成事件
             let event = MatcherTradeEvent::new_trade(
@@ -236,38 +324,34 @@ impl DirectOrderBook {
             cmd.matcher_events.push(event);
 
             if !maker_completed {
+                // 挂单仍有剩余，留在簿中。此时 new_best 尚未越过它，正好停在它上面。
                 break;
             }
 
-            // 移除完成的 maker 订单
-            let bucket_tail = self.buckets[maker_parent].tail;
-            let should_remove_bucket = idx == bucket_tail;
-
-            let next_maker = maker_prev;
+            // 移除完全成交的 maker 订单。必须走 remove_order：它会修复链表邻居
+            // 与桶的记账——STP 保留过前面的订单时，这一单可能已不在队首，
+            // 直接从 slab 删除会留下悬空的 prev/next 指针。
             self.order_id_index.remove(&self.orders[idx].order_id);
+            self.remove_order(idx);
             self.orders.remove(idx);
-
-            if should_remove_bucket {
-                let price = maker_price;
-                if is_bid {
-                    self.ask_price_buckets.remove(&price);
-                } else {
-                    self.bid_price_buckets.remove(&price);
-                }
-                self.buckets.remove(maker_parent);
+            if front_intact {
+                new_best = maker_prev;
             }
 
-            maker_idx = next_maker;
+            maker_idx = maker_prev;
         }
 
         // 更新最优订单
         if is_bid {
-            self.best_ask_order = maker_idx;
+            self.best_ask_order = new_best;
         } else {
-            self.best_bid_order = maker_idx;
+            self.best_bid_order = new_best;
         }
 
-        filled
+        MatchResult {
+            filled,
+            taker_aborted,
+        }
     }
 
     /// 插入订单到链表
@@ -508,12 +592,27 @@ impl super::OrderBook for DirectOrderBook {
             ..Default::default()
         };
 
-        let newly_filled = self.try_match(&mut temp_cmd);
+        let MatchResult {
+            filled: newly_filled,
+            taker_aborted,
+        } = self.try_match(&mut temp_cmd);
         cmd.matcher_events.extend(temp_cmd.matcher_events);
 
         // 累加而非覆盖，否则改价会抹掉此前的成交记录
         let total_filled = filled_before + newly_filled;
         self.orders[order_idx].filled = total_filled;
+
+        // STP 判定撤销：改价后的订单不再挂回簿中，剩余量退还冻结资金
+        if taker_aborted && total_filled < size {
+            cmd.matcher_events.push(MatcherTradeEvent::new_reject(
+                size - total_filled,
+                cmd.price,
+                reserve_price,
+            ));
+            self.order_id_index.remove(&cmd.order_id);
+            self.orders.remove(order_idx);
+            return CommandResultCode::Success;
+        }
 
         if total_filled >= size {
             // 完全成交

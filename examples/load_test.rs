@@ -48,6 +48,7 @@ fn run_load_test(name: &str, config: &LoadTestConfig) {
 
     // 初始化交易对 (启动前进行以便同步地设置到 Pipeline)
     core.add_symbol(CoreSymbolSpecification {
+        stp: SelfTradePrevention::None,
         symbol_id: 1,
         symbol_type: SymbolType::CurrencyExchangePair,
         base_currency: 1,

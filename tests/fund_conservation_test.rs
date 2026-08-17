@@ -27,6 +27,7 @@ impl Harness {
     fn new() -> Self {
         let mut core = ExchangeCore::new(ExchangeConfig::default());
         core.add_symbol(CoreSymbolSpecification {
+            stp: SelfTradePrevention::None,
             symbol_id: SYM,
             symbol_type: SymbolType::CurrencyExchangePair,
             base_currency: BASE,

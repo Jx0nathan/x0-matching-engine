@@ -173,6 +173,10 @@ impl RiskEngine {
                 MatcherEventType::Reject | MatcherEventType::Reduce => {
                     self.handle_reject_event(cmd, event, &spec, taker_sell);
                 }
+                // STP 撤掉的是簿中挂单，其冻结资金在对手方向上，退款币种相反
+                MatcherEventType::RejectMaker => {
+                    self.handle_reject_event(cmd, event, &spec, !taker_sell);
+                }
             }
         }
         // 不再无条件置 Success：撮合层的拒绝码（如 MatchingUnsupportedCommand）
