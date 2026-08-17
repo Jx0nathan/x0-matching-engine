@@ -1,12 +1,11 @@
 use matching_core::api::*;
 use matching_core::core::exchange::{ExchangeCore, ExchangeConfig, ProducerType, WaitStrategyType};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::sync::Arc;
 
 /// 压力测试配置
 struct LoadTestConfig {
     num_orders: usize,
-    batch_size: usize,
 }
 
 fn main() {
@@ -14,7 +13,6 @@ fn main() {
 
     let config = LoadTestConfig {
         num_orders: 1_000_000, // 100万个订单
-        batch_size: 1000,
     };
 
     println!("测试规模: {} 订单", config.num_orders);

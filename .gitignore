@@ -2,3 +2,6 @@
 .idea
 PERFORMANCE_ROADMAP.md
 Cargo.lock
+
+# macOS 目录元数据
+.DS_Store

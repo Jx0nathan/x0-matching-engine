@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use matching_core::api::*;
 use matching_core::core::orderbook::{DirectOrderBook, NaiveOrderBook, OrderBook};
 use matching_core::core::processors::risk_engine::RiskEngine;

@@ -519,8 +519,8 @@ impl super::OrderBook for NaiveOrderBook {
             data.ask_volumes.push(bucket.total_volume);
         }
 
-        // 买单（从高到低）
-        for (price, bucket) in self.bid_buckets.iter().take(depth) {
+        // 买单（从高到低）。BTreeMap 是升序，必须 rev 才是买盘的价格优先顺序。
+        for (price, bucket) in self.bid_buckets.iter().rev().take(depth) {
             data.bid_prices.push(*price);
             data.bid_volumes.push(bucket.total_volume);
         }
