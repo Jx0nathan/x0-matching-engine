@@ -57,6 +57,24 @@ impl AdvancedBucket {
         self.orders.push(order);
     }
 
+    /// 该档对外可见的挂单笔数。
+    ///
+    /// 判据与 `visible_volume` 的累加口径保持一致：显示量为 0 的全隐藏单不计入，
+    /// 否则报出的笔数会暴露出「有单但不贡献深度」，等于泄露了隐藏单的存在。
+    fn visible_order_count(&self) -> usize {
+        self.orders
+            .iter()
+            .filter(|o| {
+                let remaining = o.size - o.filled;
+                let visible = match o.visible_size {
+                    Some(v) => v.min(remaining),
+                    None => remaining,
+                };
+                visible > 0
+            })
+            .count()
+    }
+
     fn remove(&mut self, order_id: OrderId) -> Option<AdvancedOrder> {
         if let Some(pos) = self.orders.iter().position(|o| o.order_id == order_id) {
             let order = self.orders.remove(pos);
@@ -529,11 +547,13 @@ impl super::OrderBook for AdvancedOrderBook {
         for (price, bucket) in self.ask_buckets.iter().take(depth) {
             data.ask_prices.push(*price);
             data.ask_volumes.push(bucket.visible_volume); // 显示量
+            data.ask_order_counts.push(bucket.visible_order_count());
         }
 
         for (price, bucket) in self.bid_buckets.iter().rev().take(depth) {
             data.bid_prices.push(*price);
             data.bid_volumes.push(bucket.visible_volume); // 显示量
+            data.bid_order_counts.push(bucket.visible_order_count());
         }
 
         data

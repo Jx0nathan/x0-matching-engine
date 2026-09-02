@@ -77,6 +77,55 @@ fn check_l2(name: &str, book: &mut dyn OrderBook) {
         book.get_total_bid_volume(),
         "{name}: L2 买盘总量与簿内统计不一致"
     );
+
+    // L3 笔数：每档各挂一单
+    assert_eq!(
+        l2.ask_order_counts,
+        vec![1, 1, 1],
+        "{name}: 卖盘笔数与价格未对齐"
+    );
+    assert_eq!(
+        l2.bid_order_counts,
+        vec![1, 1, 1],
+        "{name}: 买盘笔数与价格未对齐"
+    );
+}
+
+/// 同档多单、吃穿整单、部分成交三种情况下，笔数都要跟住
+fn check_l2_order_counts(name: &str, book: &mut dyn OrderBook) {
+    // 101 档三单，102 档一单
+    place(book, 1, 1, OrderAction::Ask, 101, 5);
+    place(book, 1, 2, OrderAction::Ask, 101, 5);
+    place(book, 1, 3, OrderAction::Ask, 101, 5);
+    place(book, 1, 4, OrderAction::Ask, 102, 5);
+
+    let l2 = book.get_l2_data(10);
+    assert_eq!(l2.ask_prices, vec![101, 102], "{name}: 档位不对");
+    assert_eq!(l2.ask_order_counts, vec![3, 1], "{name}: 同档多单笔数错");
+    assert_eq!(l2.ask_volumes, vec![15, 5], "{name}: 同档多单总量错");
+
+    // 吃掉 101 档一整单 + 第二单的一半 → 该档应剩 2 笔
+    place(book, 2, 5, OrderAction::Bid, 101, 8);
+    let l2 = book.get_l2_data(10);
+    assert_eq!(
+        l2.ask_order_counts,
+        vec![2, 1],
+        "{name}: 吃穿一单后笔数未减；部分成交的单必须仍计入"
+    );
+    assert_eq!(l2.ask_volumes, vec![7, 5], "{name}: 部分成交后总量错");
+
+    // 笔数与总量必须同时为真：有量必有单，有单必有量
+    for (i, (&c, &v)) in l2
+        .ask_order_counts
+        .iter()
+        .zip(l2.ask_volumes.iter())
+        .enumerate()
+    {
+        assert!(
+            (c == 0) == (v == 0),
+            "{name}: 第 {i} 档笔数({c})与量({v})自相矛盾"
+        );
+    }
 }
 
 /// depth 限制必须取最优的若干档，而不是任意若干档
@@ -97,12 +146,14 @@ fn check_l2_depth(name: &str, book: &mut dyn OrderBook) {
 fn l2_ordering_direct() {
     check_l2("DirectOrderBook", &mut DirectOrderBook::new(spec()));
     check_l2_depth("DirectOrderBook", &mut DirectOrderBook::new(spec()));
+    check_l2_order_counts("DirectOrderBook", &mut DirectOrderBook::new(spec()));
 }
 
 #[test]
 fn l2_ordering_naive() {
     check_l2("NaiveOrderBook", &mut NaiveOrderBook::new(spec()));
     check_l2_depth("NaiveOrderBook", &mut NaiveOrderBook::new(spec()));
+    check_l2_order_counts("NaiveOrderBook", &mut NaiveOrderBook::new(spec()));
 }
 
 #[test]
@@ -115,10 +166,15 @@ fn l2_ordering_direct_optimized() {
         "DirectOrderBookOptimized",
         &mut DirectOrderBookOptimized::new(spec()),
     );
+    check_l2_order_counts(
+        "DirectOrderBookOptimized",
+        &mut DirectOrderBookOptimized::new(spec()),
+    );
 }
 
 #[test]
 fn l2_ordering_advanced() {
     check_l2("AdvancedOrderBook", &mut AdvancedOrderBook::new(spec()));
     check_l2_depth("AdvancedOrderBook", &mut AdvancedOrderBook::new(spec()));
+    check_l2_order_counts("AdvancedOrderBook", &mut AdvancedOrderBook::new(spec()));
 }

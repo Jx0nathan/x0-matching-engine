@@ -87,6 +87,12 @@ impl OrdersBucket {
             }
         }
 
+        // 成交量必须从档位总量里扣掉。注意不能指望下面的 remove() 来扣：
+        // 那时 order.remaining() 已是 0，减了等于没减；部分成交的单更不会被 remove。
+        // 漏掉这一步会让 total_volume 只增不减 —— L2 深度永久虚高，
+        // 且五处 `total_volume == 0` 的删档判断全部失效，被吃光的档会赖在盘口上。
+        self.total_volume -= matched_size;
+
         // 移除完全成交的订单
         for oid in to_remove {
             self.remove(oid);
@@ -517,12 +523,14 @@ impl super::OrderBook for NaiveOrderBook {
         for (price, bucket) in self.ask_buckets.iter().take(depth) {
             data.ask_prices.push(*price);
             data.ask_volumes.push(bucket.total_volume);
+            data.ask_order_counts.push(bucket.orders.len());
         }
 
         // 买单（从高到低）。BTreeMap 是升序，必须 rev 才是买盘的价格优先顺序。
         for (price, bucket) in self.bid_buckets.iter().rev().take(depth) {
             data.bid_prices.push(*price);
             data.bid_volumes.push(bucket.total_volume);
+            data.bid_order_counts.push(bucket.orders.len());
         }
 
         data

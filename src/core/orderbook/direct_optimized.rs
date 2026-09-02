@@ -84,6 +84,7 @@ impl OrderPool {
 struct PriceBucket {
     price: Price,
     volume: Size,
+    num_orders: usize, // 该档挂单笔数，写点与 volume 严格一一对应
     head: OrderIdx, // 链表头（最早订单）
 }
 
@@ -243,6 +244,7 @@ impl DirectOrderBookOptimized {
                         let order_id = self.order_pool.hot.order_ids[current_idx];
                         self.order_index.remove(&order_id);
                         self.order_pool.dealloc(current_idx);
+                        bucket.num_orders -= 1;
                     }
 
                     if let Some(next) = self.order_pool.hot.next[current_idx] {
@@ -328,6 +330,7 @@ impl DirectOrderBookOptimized {
                         let order_id = self.order_pool.hot.order_ids[current_idx];
                         self.order_index.remove(&order_id);
                         self.order_pool.dealloc(current_idx);
+                        bucket.num_orders -= 1;
                     }
 
                     if let Some(next) = self.order_pool.hot.next[current_idx] {
@@ -457,12 +460,15 @@ impl DirectOrderBookOptimized {
                 if let Some(bucket) = buckets.get_mut(&price) {
                     // 重新计算桶的总量
                     let mut new_volume = 0;
+                    let mut new_count = 0;
                     for &idx in &order_indices {
                         if self.order_pool.hot.active[idx] {
                             new_volume += self.order_pool.hot.sizes[idx] - self.order_pool.hot.filled[idx];
+                            new_count += 1;
                         }
                     }
                     bucket.volume = new_volume;
+                    bucket.num_orders = new_count;
                     
                     if bucket.volume == 0 {
                         prices_to_remove.push(price);
@@ -556,6 +562,7 @@ impl DirectOrderBookOptimized {
             .entry(price)
             .and_modify(|bucket| {
                 bucket.volume += size;
+                bucket.num_orders += 1;
                 let old_head = bucket.head;
                 self.order_pool.hot.next[order_idx] = Some(old_head);
                 self.order_pool.hot.prev[old_head] = Some(order_idx);
@@ -565,6 +572,7 @@ impl DirectOrderBookOptimized {
                 PriceBucket {
                     price,
                     volume: size,
+                    num_orders: 1,
                     head: order_idx,
                 }
             });
@@ -645,11 +653,13 @@ impl super::OrderBook for DirectOrderBookOptimized {
         for (price, bucket) in self.ask_buckets.iter().take(depth) {
             data.ask_prices.push(*price);
             data.ask_volumes.push(bucket.volume);
+            data.ask_order_counts.push(bucket.num_orders);
         }
 
         for (price, bucket) in self.bid_buckets.iter().rev().take(depth) {
             data.bid_prices.push(*price);
             data.bid_volumes.push(bucket.volume);
+            data.bid_order_counts.push(bucket.num_orders);
         }
 
         data

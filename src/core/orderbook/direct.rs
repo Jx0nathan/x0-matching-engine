@@ -672,11 +672,13 @@ impl super::OrderBook for DirectOrderBook {
         for (price, &bucket_idx) in self.ask_price_buckets.iter().take(depth) {
             data.ask_prices.push(*price);
             data.ask_volumes.push(self.buckets[bucket_idx].volume);
+            data.ask_order_counts.push(self.buckets[bucket_idx].num_orders);
         }
 
         for (price, &bucket_idx) in self.bid_price_buckets.iter().rev().take(depth) {
             data.bid_prices.push(*price);
             data.bid_volumes.push(self.buckets[bucket_idx].volume);
+            data.bid_order_counts.push(self.buckets[bucket_idx].num_orders);
         }
 
         data
