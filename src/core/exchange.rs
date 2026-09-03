@@ -165,10 +165,32 @@ impl ExchangeCore {
         }
     }
 
-    /// 启用快照管理
+    /// 启用快照管理。必须在 `startup()` 之前调用。
+    ///
+    /// 除了自己留一份（同步态直接落快照、以及压缩时查最新档案号），还要把出口装进
+    /// pipeline —— 启动后 pipeline 归撮合线程所有，那时只有它能读到状态。
     pub fn enable_snapshotting<P: AsRef<Path>>(&mut self, path: P) -> anyhow::Result<()> {
-        self.snapshot_store = Some(SnapshotStore::new(path)?);
+        self.ensure_not_started("enable_snapshotting()")?;
+        let store = SnapshotStore::new(path)?;
+        if let Some(p) = &mut self.pipeline {
+            p.set_snapshot_sink(store.clone(), self.config.clone());
+        }
+        self.snapshot_store = Some(store);
         Ok(())
+    }
+
+    /// 请求一次快照。**同步态与异步态通用**。
+    ///
+    /// 走的是带内控制命令：命令排在正常命令流里进入撮合线程，由持有状态的那一方
+    /// 就地落盘。这样异步态下也能做检查点 —— `take_snapshot()` 做不到，因为
+    /// 启动后 `ExchangeCore` 已经读不到状态了。
+    ///
+    /// 异步态下返回 `Accepted`，快照是否写成要看结果回调里的 `result_code`。
+    pub fn request_snapshot(&mut self) -> OrderCommand {
+        self.submit_command(OrderCommand {
+            command: OrderCommandType::PersistStateMatching,
+            ..Default::default()
+        })
     }
 
     /// 生成当前状态快照，以「已应用的最后一条命令序号」为档案号。
@@ -295,18 +317,30 @@ impl ExchangeCore {
     /// 异步模式（已 `startup()`）：命令只是投递进环形缓冲区，返回值的 `result_code`
     /// 为 `Accepted`，**真正的撮合结果只能通过 `set_result_consumer` 注册的回调获取**。
     pub fn submit_command(&mut self, mut cmd: OrderCommand) -> OrderCommand {
-        if let Some(j) = &mut self.journaler {
-            match j.write_command(&cmd) {
-                Ok(seq) => self.last_seq = seq,
-                // 不推进 last_seq：这条命令没能进日志，就不能被算进任何快照的覆盖范围
-                Err(e) => tracing::error!(
-                    order_id = cmd.order_id,
-                    uid = cmd.uid,
-                    error = %e,
-                    "WAL 写入失败，该命令将无法被重放"
-                ),
+        // 控制命令不改变状态机，不写 WAL：写进去只会让每次重放都凭空多做一次快照。
+        let is_control = matches!(
+            cmd.command,
+            OrderCommandType::PersistStateMatching | OrderCommandType::PersistStateRisk
+        );
+
+        if !is_control {
+            if let Some(j) = &mut self.journaler {
+                match j.write_command(&cmd) {
+                    Ok(seq) => self.last_seq = seq,
+                    // 不推进 last_seq：这条命令没能进日志，就不能被算进任何快照的覆盖范围
+                    Err(e) => tracing::error!(
+                        order_id = cmd.order_id,
+                        uid = cmd.uid,
+                        error = %e,
+                        "WAL 写入失败，该命令将无法被重放"
+                    ),
+                }
             }
         }
+
+        // 序号随命令一路流到撮合线程。普通命令带的是自己的序号；控制命令带的是
+        // 它之前那条命令的序号 —— 正好等于"快照将覆盖到第几条"。
+        cmd.seq = self.last_seq;
 
         if let Some(producer) = &mut self.producer {
             producer.publish(cmd.clone());

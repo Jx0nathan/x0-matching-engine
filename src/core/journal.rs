@@ -379,9 +379,11 @@ impl Journaler {
 
             if seq > after_seq {
                 // 已通过 check_archived_root 校验，反序列化的错误类型是 Infallible
-                let cmd: OrderCommand = archived
+                let mut cmd: OrderCommand = archived
                     .deserialize(&mut rkyv::Infallible)
                     .expect("Infallible 不可能失败");
+                // seq 被 rkyv 的 Skip 排除在 payload 之外，权威来源是记录头，这里回填
+                cmd.seq = seq;
                 commands.push(cmd);
             }
 

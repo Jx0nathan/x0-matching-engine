@@ -498,3 +498,226 @@ fn compaction_refused_without_snapshotting() {
     assert_eq!(core.compact_journal().unwrap(), 0, "没有快照时不得回收任何字节");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ------------------------------------------------------------ 带内快照（异步态）
+
+/// 异步态下必须能做快照 —— 这是 take_snapshot() 做不到的：
+/// startup() 之后 pipeline 已移交撮合线程，ExchangeCore 读不到状态。
+#[test]
+fn in_band_snapshot_works_after_startup() {
+    let dir = temp_dir("inband_snapshot");
+    let journal = dir.join("journal.bin");
+    let snaps = dir.join("snapshots");
+
+    let done = Arc::new(AtomicUsize::new(0));
+    let done2 = done.clone();
+    let persist_ok = Arc::new(AtomicUsize::new(0));
+    let persist_ok2 = persist_ok.clone();
+
+    let mut core = new_core();
+    core.enable_journaling(&journal).unwrap();
+    core.enable_snapshotting(&snaps).unwrap();
+    core.set_result_consumer(Arc::new(move |cmd: &OrderCommand| {
+        if cmd.command == OrderCommandType::PersistStateMatching
+            && cmd.result_code == CommandResultCode::Success
+        {
+            persist_ok2.fetch_add(1, Ordering::SeqCst);
+        }
+        done2.fetch_add(1, Ordering::SeqCst);
+    }))
+    .unwrap();
+
+    core.startup();
+    assert!(core.take_snapshot().is_err(), "启动后直连快照仍应被拒绝");
+
+    core.submit_command(OrderCommand {
+        command: OrderCommandType::AddUser,
+        uid: 1,
+        ..Default::default()
+    });
+    core.submit_command(OrderCommand {
+        command: OrderCommandType::BalanceAdjustment,
+        uid: 1,
+        symbol: 1,
+        price: 7_000,
+        order_id: 1,
+        ..Default::default()
+    });
+    let accepted = core.request_snapshot();
+    assert_eq!(
+        accepted.result_code,
+        CommandResultCode::Accepted,
+        "异步态下快照请求应先回 Accepted"
+    );
+
+    // 等消费者把三条命令都处理完
+    for _ in 0..200 {
+        if done.load(Ordering::SeqCst) >= 3 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(done.load(Ordering::SeqCst), 3, "消费者未处理完全部命令");
+    assert_eq!(persist_ok.load(Ordering::SeqCst), 1, "带内快照未成功落盘");
+
+    // 快照应以"它之前那条命令的序号"为档案号，即 2
+    let store = matching_core::core::snapshot::SnapshotStore::new(&snaps).unwrap();
+    assert_eq!(
+        store.get_latest_seq_id().unwrap(),
+        Some(2),
+        "快照档案号应等于已覆盖的最后一条命令序号"
+    );
+
+    // 从这份快照恢复，状态必须完整
+    let mut restored = new_core();
+    restored.enable_snapshotting(&snaps).unwrap();
+    assert!(restored.load_latest_snapshot().unwrap());
+    assert_eq!(
+        restored.balance_of(1, 1).unwrap(),
+        7_000,
+        "撮合线程写出的快照未包含完整状态"
+    );
+    assert_eq!(restored.last_seq(), 2);
+
+    // 再补重放：日志里没有比快照更新的命令，应当一条都不放
+    let summary = restored.replay_journal(&journal).expect("重放失败");
+    assert_eq!(summary.replayed, 0, "快照已覆盖全部命令，不应再重放");
+    assert_eq!(restored.balance_of(1, 1).unwrap(), 7_000);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 控制命令不进 WAL：否则每次重放都会凭空多做一次快照，而且会挤占序号
+#[test]
+fn control_commands_are_not_journaled() {
+    let dir = temp_dir("inband_not_journaled");
+    let journal = dir.join("journal.bin");
+    let snaps = dir.join("snapshots");
+
+    let mut core = new_core();
+    core.enable_journaling(&journal).unwrap();
+    core.enable_snapshotting(&snaps).unwrap();
+
+    add_user(&mut core, 1);
+    core.request_snapshot(); // 同步态下就地执行
+    add_user(&mut core, 2);
+    core.sync_journal().unwrap();
+
+    // 日志里只应有两条 AddUser，序号 1、2 连续，没有被控制命令挤占
+    let outcome = matching_core::core::journal::Journaler::read_commands(&journal).unwrap();
+    assert_eq!(outcome.commands.len(), 2, "控制命令不应出现在 WAL 里");
+    assert!(
+        outcome
+            .commands
+            .iter()
+            .all(|c| c.command == OrderCommandType::AddUser),
+        "WAL 中混入了控制命令"
+    );
+    assert_eq!(
+        outcome.commands.iter().map(|c| c.seq).collect::<Vec<_>>(),
+        vec![1, 2],
+        "重放时 seq 应从记录头回填，且不被控制命令挤占"
+    );
+
+    // 快照应停在请求时刻的序号 1，而不是 2
+    let store = matching_core::core::snapshot::SnapshotStore::new(&snaps).unwrap();
+    assert_eq!(store.get_latest_seq_id().unwrap(), Some(1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 未启用快照时收到快照命令，必须明确报错而不是静默当作成功
+#[test]
+fn in_band_snapshot_without_store_reports_failure() {
+    let mut core = new_core();
+    let result = core.request_snapshot();
+    assert_eq!(
+        result.result_code,
+        CommandResultCode::StatePersistMatchingEngineFailed,
+        "没有快照存储时不得静默成功"
+    );
+}
+
+/// 生产态的完整检查点循环：异步跑单 -> 带内快照 -> 压缩日志 -> 崩溃恢复。
+/// 这是"日志无限增长"那个问题真正被解决的证明。
+#[test]
+fn async_checkpoint_then_compact_then_recover() {
+    let dir = temp_dir("async_full_loop");
+    let journal = dir.join("journal.bin");
+    let snaps = dir.join("snapshots");
+
+    let done = Arc::new(AtomicUsize::new(0));
+    let done2 = done.clone();
+
+    let mut core = new_core();
+    core.enable_journaling(&journal).unwrap();
+    core.enable_snapshotting(&snaps).unwrap();
+    core.set_result_consumer(Arc::new(move |_: &OrderCommand| {
+        done2.fetch_add(1, Ordering::SeqCst);
+    }))
+    .unwrap();
+    core.startup();
+
+    // 快照前：开户 + 充值 1000，共 2 条命令
+    core.submit_command(OrderCommand {
+        command: OrderCommandType::AddUser,
+        uid: 1,
+        ..Default::default()
+    });
+    core.submit_command(OrderCommand {
+        command: OrderCommandType::BalanceAdjustment,
+        uid: 1,
+        symbol: 1,
+        price: 1_000,
+        order_id: 1,
+        ..Default::default()
+    });
+    core.request_snapshot();
+
+    for _ in 0..200 {
+        if done.load(Ordering::SeqCst) >= 3 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(done.load(Ordering::SeqCst), 3, "快照命令未被消费");
+
+    // 快照落盘后压缩：前两条命令的日志应被回收
+    core.sync_journal().unwrap();
+    let before = std::fs::metadata(&journal).unwrap().len();
+    let reclaimed = core.compact_journal().expect("压缩失败");
+    assert!(reclaimed > 0, "快照已覆盖前两条命令，日志前缀应被回收");
+    assert!(std::fs::metadata(&journal).unwrap().len() < before);
+
+    // 快照后再充值 250，这条只存在于压缩后的日志里
+    core.submit_command(OrderCommand {
+        command: OrderCommandType::BalanceAdjustment,
+        uid: 1,
+        symbol: 1,
+        price: 250,
+        order_id: 2,
+        ..Default::default()
+    });
+    for _ in 0..200 {
+        if done.load(Ordering::SeqCst) >= 4 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    core.sync_journal().unwrap();
+
+    // 模拟崩溃重启：快照给 1000，压缩后的日志补上 250
+    let mut restored = new_core();
+    restored.enable_snapshotting(&snaps).unwrap();
+    assert!(restored.load_latest_snapshot().unwrap());
+    assert_eq!(restored.balance_of(1, 1).unwrap(), 1_000, "快照应含 1000");
+
+    let summary = restored.replay_journal(&journal).expect("重放失败");
+    assert_eq!(summary.replayed, 1, "压缩后日志里只应剩快照之后的那 1 条");
+    assert_eq!(
+        restored.balance_of(1, 1).unwrap(),
+        1_250,
+        "压缩 + 增量重放后状态不一致"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

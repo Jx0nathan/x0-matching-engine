@@ -1,5 +1,6 @@
 use crate::api::*;
-use crate::core::exchange::{ExchangeConfig, ResultConsumer};
+use crate::core::exchange::{ExchangeConfig, ExchangeState, ResultConsumer};
+use crate::core::snapshot::SnapshotStore;
 use crate::core::processors::{matching_engine::{MatchingEngineRouter, MatchingEngineState}, risk_engine::RiskEngine};
 use serde::{Deserialize, Serialize};
 
@@ -9,16 +10,40 @@ pub struct PipelineState {
     pub matching_engines: Vec<MatchingEngineState>,
 }
 
+/// 带内快照的落盘出口。
+///
+/// 启动后 pipeline 归 Disruptor 消费者线程所有，外部再也拿不到状态，
+/// 所以快照只能由"持有状态的那个线程"自己写。这个 sink 就跟着 pipeline
+/// 一起被移交过去。config 是快照文件的一部分，随之带上一份副本。
+struct SnapshotSink {
+    store: SnapshotStore,
+    config: ExchangeConfig,
+}
+
 /// 流水线 - 组织各个处理器
 pub struct Pipeline {
     risk_engines: Vec<RiskEngine>,
     matching_engines: Vec<MatchingEngineRouter>,
     result_consumer: Option<ResultConsumer>,
+    snapshot_sink: Option<SnapshotSink>,
 }
 
 impl Pipeline {
     /// 处理单个命令（完整流水线）
     pub fn handle_event(&mut self, cmd: &mut OrderCommand, _sequence: i64, _end_of_batch: bool) {
+        // 0. 带内控制命令：不经风控与撮合，就地处理后直接交给结果消费者。
+        //    快照必须走这条路，因为只有本线程能读到状态。
+        if matches!(
+            cmd.command,
+            OrderCommandType::PersistStateMatching | OrderCommandType::PersistStateRisk
+        ) {
+            self.persist_state(cmd);
+            if let Some(consumer) = &self.result_consumer {
+                consumer(cmd);
+            }
+            return;
+        }
+
         // 1. Risk R1 (预处理)
         for engine in &mut self.risk_engines {
             engine.pre_process(cmd);
@@ -39,6 +64,39 @@ impl Pipeline {
             consumer(cmd);
         }
     }
+    /// 就地把整条流水线的状态写成快照，档案号取命令自带的全局序号。
+    ///
+    /// 该序号是"这条命令之前已应用的最后一条命令"的序号（控制命令本身不入 WAL、
+    /// 不改状态），因此快照内容与档案号严格对应，恢复时按它跳过日志前缀即可。
+    ///
+    /// 注意：序列化在撮合线程内同步完成，期间该线程不消费新命令 —— 这是一次
+    /// stop-the-world 停顿，时长随订单簿规模增长。
+    fn persist_state(&self, cmd: &mut OrderCommand) {
+        let Some(sink) = &self.snapshot_sink else {
+            tracing::error!(seq = cmd.seq, "收到快照命令，但未启用快照存储");
+            cmd.result_code = CommandResultCode::StatePersistMatchingEngineFailed;
+            return;
+        };
+
+        let state = ExchangeState {
+            config: sink.config.clone(),
+            pipeline_state: self.serialize_state(),
+        };
+
+        match sink.store.save_snapshot(&state, cmd.seq) {
+            Ok(_) => cmd.result_code = CommandResultCode::Success,
+            Err(e) => {
+                tracing::error!(seq = cmd.seq, error = %e, "带内快照写入失败");
+                cmd.result_code = CommandResultCode::StatePersistMatchingEngineFailed;
+            }
+        }
+    }
+
+    /// 装配快照出口。必须在 `startup()` 之前调用 —— 之后 pipeline 就不在本地了。
+    pub fn set_snapshot_sink(&mut self, store: SnapshotStore, config: ExchangeConfig) {
+        self.snapshot_sink = Some(SnapshotSink { store, config });
+    }
+
     pub fn serialize_state(&self) -> PipelineState {
         PipelineState {
             risk_engines: self.risk_engines.clone(),
@@ -51,6 +109,7 @@ impl Pipeline {
             risk_engines: state.risk_engines,
             matching_engines: state.matching_engines.into_iter().map(MatchingEngineRouter::from_state).collect(),
             result_consumer: None,
+            snapshot_sink: None,
         }
     }
     pub fn new(config: &ExchangeConfig) -> Self {
@@ -68,6 +127,7 @@ impl Pipeline {
             risk_engines,
             matching_engines,
             result_consumer: None,
+            snapshot_sink: None,
         }
     }
 

@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 /// 快照管理器（使用 bincode，兼容性好）
+///
+/// 只持有一个基础路径，clone 很便宜 —— 带内快照需要给撮合线程一份副本。
+#[derive(Clone)]
 pub struct SnapshotStore {
     base_path: PathBuf,
 }
