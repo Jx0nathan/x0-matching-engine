@@ -60,6 +60,8 @@ use std::path::Path;
 pub struct ReplaySummary {
     /// 成功重放的命令条数
     pub replayed: usize,
+    /// 重放结束后的全局序号（= 日志中最后一条完整记录的序号）
+    pub last_seq: u64,
     /// 日志尾部从该偏移起损坏；None 表示日志完整
     pub truncated_at: Option<u64>,
 }
@@ -89,6 +91,9 @@ pub struct ExchangeCore {
     pipeline: Option<Pipeline>,
     journaler: Option<Journaler>,
     snapshot_store: Option<SnapshotStore>,
+    /// 已应用到状态机的最后一条命令的全局序号。
+    /// 快照按它存档，重放按它跳过前缀 —— 两者对齐，恢复才不会重复执行。
+    last_seq: u64,
 }
 
 impl ExchangeCore {
@@ -100,7 +105,13 @@ impl ExchangeCore {
             producer: None,
             journaler: None,
             snapshot_store: None,
+            last_seq: 0,
         }
+    }
+
+    /// 已应用到状态机的最后一条命令的全局序号
+    pub fn last_seq(&self) -> u64 {
+        self.last_seq
     }
 
     /// 是否已进入异步模式。`startup()` 会把 pipeline 移交给 Disruptor 消费者线程，
@@ -160,14 +171,43 @@ impl ExchangeCore {
         Ok(())
     }
 
-    /// 生成当前状态快照
-    pub fn take_snapshot(&self, seq_id: u64) -> anyhow::Result<()> {
+    /// 生成当前状态快照，以「已应用的最后一条命令序号」为档案号。
+    ///
+    /// 序号由内部维护而非调用方指定：快照内容与序号必须严格对应，
+    /// 否则恢复时会以错误的位置重放日志 —— 号小了重复执行，号大了丢命令。
+    pub fn take_snapshot(&self) -> anyhow::Result<()> {
         self.ensure_not_started("take_snapshot()")?;
         if let Some(store) = &self.snapshot_store {
             let state = self.serialize_state()?;
-            store.save_snapshot(&state, seq_id)?;
+            store.save_snapshot(&state, self.last_seq)?;
         }
         Ok(())
+    }
+
+    /// 丢弃已被最新快照覆盖的那段 WAL 前缀，返回回收的字节数。
+    ///
+    /// 截断上界取自**最新快照的序号**，而不是 `last_seq`——这样在设计上就不可能
+    /// 丢掉尚未被任何快照覆盖的日志。未启用快照时直接拒绝。
+    pub fn compact_journal(&mut self) -> anyhow::Result<u64> {
+        let Some(store) = &self.snapshot_store else {
+            anyhow::bail!("未启用快照，压缩 WAL 会导致这段命令再也无法恢复");
+        };
+        let Some(snapshot_seq) = store.get_latest_seq_id()? else {
+            return Ok(0); // 还没有任何快照，什么都不能丢
+        };
+        match &mut self.journaler {
+            Some(j) => j.compact_before(snapshot_seq),
+            None => Ok(0),
+        }
+    }
+
+    /// 检查点：先落快照，再丢弃被它覆盖的日志前缀。返回回收的字节数。
+    ///
+    /// 顺序不可颠倒，且 `save_snapshot` 内部已 fsync + 原子替换——
+    /// 先截断后落盘的话，中间崩溃就是永久的数据丢失。
+    pub fn checkpoint(&mut self) -> anyhow::Result<u64> {
+        self.take_snapshot()?;
+        self.compact_journal()
     }
 
     /// 加载最新的快照并恢复状态
@@ -176,12 +216,12 @@ impl ExchangeCore {
 
         let loaded = match &self.snapshot_store {
             Some(store) => match store.get_latest_seq_id()? {
-                Some(seq_id) => Some(store.load_snapshot(seq_id)?),
+                Some(seq_id) => Some((seq_id, store.load_snapshot(seq_id)?)),
                 None => None,
             },
             None => None,
         };
-        let Some(state) = loaded else {
+        let Some((seq_id, state)) = loaded else {
             return Ok(false);
         };
 
@@ -189,6 +229,8 @@ impl ExchangeCore {
         // 早先这里整体覆盖 self，会把两者置空，导致恢复后静默停止写 WAL。
         self.config = state.config;
         self.pipeline = Some(Pipeline::from_state(state.pipeline_state));
+        // 快照的档案号就是它所包含的最后一条命令的序号，重放据此跳过前缀
+        self.last_seq = seq_id;
         Ok(true)
     }
 
@@ -254,7 +296,16 @@ impl ExchangeCore {
     /// 为 `Accepted`，**真正的撮合结果只能通过 `set_result_consumer` 注册的回调获取**。
     pub fn submit_command(&mut self, mut cmd: OrderCommand) -> OrderCommand {
         if let Some(j) = &mut self.journaler {
-            let _ = j.write_command(&cmd);
+            match j.write_command(&cmd) {
+                Ok(seq) => self.last_seq = seq,
+                // 不推进 last_seq：这条命令没能进日志，就不能被算进任何快照的覆盖范围
+                Err(e) => tracing::error!(
+                    order_id = cmd.order_id,
+                    uid = cmd.uid,
+                    error = %e,
+                    "WAL 写入失败，该命令将无法被重放"
+                ),
+            }
         }
 
         if let Some(producer) = &mut self.producer {
@@ -280,7 +331,9 @@ impl ExchangeCore {
     pub fn replay_journal<P: AsRef<Path>>(&mut self, path: P) -> anyhow::Result<ReplaySummary> {
         self.ensure_not_started("replay_journal()")?;
 
-        let outcome = Journaler::read_commands(path)?;
+        // 只重放快照之后的命令。快照已经包含了 last_seq 及之前所有命令的效果，
+        // 再放一遍就是重复下单、重复扣款。
+        let outcome = Journaler::read_commands_after(path, self.last_seq)?;
         let replayed = outcome.commands.len();
 
         let pipeline = self
@@ -291,8 +344,13 @@ impl ExchangeCore {
             pipeline.handle_event(&mut cmd, 0, true);
         }
 
+        if let Some(seq) = outcome.last_seq {
+            self.last_seq = self.last_seq.max(seq);
+        }
+
         Ok(ReplaySummary {
             replayed,
+            last_seq: self.last_seq,
             truncated_at: outcome.truncated_at,
         })
     }
@@ -316,6 +374,7 @@ impl ExchangeCore {
             producer: None,
             journaler: None,
             snapshot_store: None,
+            last_seq: 0,
         }
     }
 }

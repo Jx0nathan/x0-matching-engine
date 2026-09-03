@@ -271,7 +271,7 @@ fn main() {
     }).expect("注册交易对失败");
 
     println!("生成快照 (ID: 1)...");
-    core_snap.take_snapshot(1).expect("生成快照失败");
+    core_snap.take_snapshot().expect("生成快照失败");
 
     println!("从快照目录恢复到新核心...");
     let mut core_restored = ExchangeCore::new(ExchangeConfig::default());

@@ -84,7 +84,7 @@ fn snapshot_after_startup_errors() {
     core.enable_snapshotting(&dir).unwrap();
     core.startup();
 
-    assert!(core.take_snapshot(1).is_err(), "启动后应拒绝快照");
+    assert!(core.take_snapshot().is_err(), "启动后应拒绝快照");
     assert!(core.serialize_state().is_err(), "启动后应拒绝序列化状态");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -182,6 +182,11 @@ fn duplicate_order_id_rejected_and_refunded() {
 
 // ---------------------------------------------------------------- WAL
 
+/// 记录头布局：magic(4) + seq(8) + len(4) + crc(4)。与 journal.rs 的 HEADER_LEN 同步。
+const HEADER_LEN: usize = 20;
+/// len 字段在记录头中的位置
+const LEN_FIELD: std::ops::Range<usize> = 12..16;
+
 fn write_journal(path: &std::path::Path, count: u64) {
     let mut core = new_core();
     core.enable_journaling(path).expect("启用 WAL 失败");
@@ -237,9 +242,9 @@ fn wal_corrupted_payload_detected_by_crc() {
     let path = dir.join("journal.bin");
     write_journal(&path, 3);
 
-    // 翻转第一条记录 payload 的首字节（记录头占 12 字节）
+    // 翻转第一条记录 payload 的首字节
     let mut bytes = std::fs::read(&path).unwrap();
-    bytes[12] ^= 0xFF;
+    bytes[HEADER_LEN] ^= 0xFF;
     std::fs::write(&path, &bytes).unwrap();
 
     let mut core = new_core();
@@ -258,7 +263,7 @@ fn wal_absurd_length_is_rejected() {
 
     // 把第一条记录的 len 字段改成 4GB
     let mut bytes = std::fs::read(&path).unwrap();
-    bytes[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+    bytes[LEN_FIELD].copy_from_slice(&u32::MAX.to_le_bytes());
     std::fs::write(&path, &bytes).unwrap();
 
     let mut core = new_core();
@@ -343,5 +348,153 @@ fn replay_restores_balances() {
         5_000,
         "重放后余额未恢复"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------- 全局序号 · 检查点 · 前缀压缩
+
+/// 给账户加钱的命令，金额直接决定余额，便于断言"有没有被重复执行"
+fn credit(core: &mut ExchangeCore, uid: UserId, order_id: u64, amount: i64) {
+    core.submit_command(OrderCommand {
+        command: OrderCommandType::BalanceAdjustment,
+        uid,
+        symbol: 1,
+        price: amount,
+        order_id,
+        ..Default::default()
+    });
+}
+
+/// 序号必须单调递增，且重开日志时从文件尾部续上而不是从头开始
+#[test]
+fn journal_seq_is_monotonic_and_survives_reopen() {
+    let dir = temp_dir("wal_seq_resume");
+    let path = dir.join("journal.bin");
+
+    {
+        let mut core = new_core();
+        core.enable_journaling(&path).unwrap();
+        assert_eq!(core.last_seq(), 0, "尚未写入时序号应为 0");
+        add_user(&mut core, 1);
+        add_user(&mut core, 2);
+        core.sync_journal().unwrap();
+        assert_eq!(core.last_seq(), 2, "两条命令应得到序号 1、2");
+    }
+
+    // 重新打开同一个日志继续写：序号必须接着 2 往下，而不是重新从 1 开始
+    {
+        let mut core = new_core();
+        core.enable_journaling(&path).unwrap();
+        add_user(&mut core, 3);
+        core.sync_journal().unwrap();
+        assert_eq!(core.last_seq(), 3, "重开日志后序号未续上，快照与日志将无法对齐");
+    }
+
+    let mut core = new_core();
+    let summary = core.replay_journal(&path).expect("重放失败");
+    assert_eq!(summary.replayed, 3);
+    assert_eq!(summary.last_seq, 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 检查点之后再恢复：快照覆盖的那段命令绝不能被重放第二遍
+#[test]
+fn checkpoint_then_replay_does_not_double_apply() {
+    let dir = temp_dir("wal_checkpoint");
+    let journal = dir.join("journal.bin");
+    let snaps = dir.join("snapshots");
+
+    {
+        let mut core = new_core();
+        core.enable_journaling(&journal).unwrap();
+        core.enable_snapshotting(&snaps).unwrap();
+
+        add_user(&mut core, 1);
+        credit(&mut core, 1, 1, 5_000); // 快照前
+        assert_eq!(core.balance_of(1, 1).unwrap(), 5_000);
+
+        let reclaimed = core.checkpoint().expect("检查点失败");
+        assert!(reclaimed > 0, "快照已覆盖全部命令，日志前缀应被回收");
+
+        credit(&mut core, 1, 2, 300); // 快照后
+        core.sync_journal().unwrap();
+        assert_eq!(core.balance_of(1, 1).unwrap(), 5_300);
+    }
+
+    // 恢复：快照给出 5000，日志只应补上快照之后的那 300
+    let mut restored = new_core();
+    restored.enable_snapshotting(&snaps).unwrap();
+    assert!(restored.load_latest_snapshot().unwrap(), "应加载到快照");
+    assert_eq!(restored.balance_of(1, 1).unwrap(), 5_000, "快照本身应含 5000");
+
+    let summary = restored.replay_journal(&journal).expect("重放失败");
+    assert_eq!(summary.replayed, 1, "只应重放快照之后的那 1 条命令");
+    assert_eq!(
+        restored.balance_of(1, 1).unwrap(),
+        5_300,
+        "余额被重复累加说明快照覆盖的命令又放了一遍"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 压缩只丢弃快照覆盖的前缀，后缀记录必须原样保留（序号也不变）
+#[test]
+fn compaction_keeps_suffix_intact() {
+    let dir = temp_dir("wal_compact_suffix");
+    let journal = dir.join("journal.bin");
+    let snaps = dir.join("snapshots");
+
+    let mut core = new_core();
+    core.enable_journaling(&journal).unwrap();
+    core.enable_snapshotting(&snaps).unwrap();
+
+    for uid in 1..=5 {
+        add_user(&mut core, uid);
+    }
+    core.take_snapshot().expect("快照失败"); // 覆盖到 seq 5
+    for uid in 6..=8 {
+        add_user(&mut core, uid);
+    }
+    core.sync_journal().unwrap();
+
+    let before = std::fs::metadata(&journal).unwrap().len();
+    let reclaimed = core.compact_journal().expect("压缩失败");
+    let after = std::fs::metadata(&journal).unwrap().len();
+    assert_eq!(before - after, reclaimed, "回收字节数与文件缩减量不符");
+    assert!(after > 0, "后缀记录不应被一起丢掉");
+
+    // 压缩后的日志里应只剩 seq 6..=8，且序号原样保留
+    let outcome = matching_core::core::journal::Journaler::read_commands(&journal).unwrap();
+    assert_eq!(outcome.commands.len(), 3, "应只剩快照之后的 3 条");
+    assert_eq!(outcome.last_seq, Some(8), "压缩不得重排序号");
+    assert_eq!(outcome.truncated_at, None, "压缩后的日志应当是完整的");
+
+    // 压缩后继续追加，序号仍要接着走
+    add_user(&mut core, 9);
+    core.sync_journal().unwrap();
+    assert_eq!(core.last_seq(), 9);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 没有快照兜底时，压缩必须被拒绝 —— 否则那段命令再也回不来
+#[test]
+fn compaction_refused_without_snapshotting() {
+    let dir = temp_dir("wal_compact_guard");
+    let journal = dir.join("journal.bin");
+
+    let mut core = new_core();
+    core.enable_journaling(&journal).unwrap();
+    add_user(&mut core, 1);
+    core.sync_journal().unwrap();
+
+    let err = core.compact_journal().unwrap_err();
+    assert!(
+        err.to_string().contains("未启用快照"),
+        "未启用快照时压缩应报错，实际: {err}"
+    );
+
+    // 启用了快照但一次都没做过，也不能丢任何东西
+    core.enable_snapshotting(dir.join("snapshots")).unwrap();
+    assert_eq!(core.compact_journal().unwrap(), 0, "没有快照时不得回收任何字节");
     let _ = std::fs::remove_dir_all(&dir);
 }

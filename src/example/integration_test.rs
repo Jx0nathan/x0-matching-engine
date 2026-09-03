@@ -51,7 +51,7 @@ pub fn test_full_flow() {
     });
 
     println!("    Taking snapshot...");
-    core.take_snapshot(1).unwrap();
+    core.take_snapshot().unwrap();
 
     println!("    Recovering into new core...");
     let mut core2 = ExchangeCore::new(ExchangeConfig::default());

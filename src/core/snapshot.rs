@@ -1,6 +1,6 @@
 use crate::core::exchange::ExchangeState;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
@@ -18,16 +18,30 @@ impl SnapshotStore {
         Ok(Self { base_path })
     }
 
-    /// 保存核心状态到快照文件
+    /// 保存核心状态到快照文件。
+    ///
+    /// 走 临时文件 -> fsync -> rename -> fsync 父目录：
+    /// 快照是 WAL 前缀压缩的唯一依据，一旦它只停在页缓存里（或写了一半），
+    /// 压缩掉的那段日志就再也补不回来了。原子替换保证任何时刻崩溃，
+    /// 看到的要么是上一个完整快照，要么是这一个完整快照。
     pub fn save_snapshot(&self, state: &ExchangeState, seq_id: u64) -> Result<PathBuf> {
         let filename = format!("snapshot_{}.bin", seq_id);
-        let path = self.base_path.join(filename);
-        
-        let file = File::create(&path).context("无法创建快照文件")?;
-        let writer = BufWriter::new(file);
-        
-        bincode::serialize_into(writer, state).context("序列化快照失败")?;
-        
+        let path = self.base_path.join(&filename);
+        let tmp_path = self.base_path.join(format!("{}.tmp", filename));
+
+        {
+            let file = File::create(&tmp_path).context("无法创建快照临时文件")?;
+            let mut writer = BufWriter::new(file);
+            bincode::serialize_into(&mut writer, state).context("序列化快照失败")?;
+            writer.flush().context("快照 flush 失败")?;
+            writer.get_ref().sync_all().context("快照 fsync 失败")?;
+        }
+
+        fs::rename(&tmp_path, &path).context("快照原子替换失败")?;
+        if let Ok(dir) = File::open(&self.base_path) {
+            let _ = dir.sync_all();
+        }
+
         Ok(path)
     }
 
