@@ -721,3 +721,108 @@ fn async_checkpoint_then_compact_then_recover() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ------------------------------------------------------------ 撮合线程 panic 兜底
+
+/// 撮合线程 panic 必须被兜住。
+///
+/// 未兜住时的实测行为：panic 逃出 handler 后在 disruptor 的析构路径上引发二次
+/// panic，整个进程被 SIGABRT（"panic in a destructor during cleanup"）。最终
+/// 打出来的是析构期二次 panic 的信息，**原始 panic 是哪条命令触发的完全看不出来**，
+/// WAL 也没有机会收尾。
+///
+/// 这里用一个会 panic 的结果回调触发（下游回调有 bug 是真实场景），校验引擎转入
+/// 中毒状态并对后续命令快速失败，而不是把进程带走。
+/// 想复现未兜住时的行为：把 exchange.rs 里的 catch_unwind 去掉再跑本用例。
+#[test]
+fn panicking_consumer_poisons_engine_instead_of_aborting() {
+    let seen = Arc::new(AtomicUsize::new(0));
+    let seen2 = seen.clone();
+
+    let mut core = new_core();
+    core.set_result_consumer(Arc::new(move |_: &OrderCommand| {
+        // 第一条正常放行，之后每条都炸
+        if seen2.fetch_add(1, Ordering::SeqCst) >= 1 {
+            panic!("下游回调故意 panic");
+        }
+    }))
+    .unwrap();
+    core.startup();
+
+    assert!(!core.is_poisoned(), "初始不应中毒");
+
+    let ok = core.submit_command(OrderCommand {
+        command: OrderCommandType::AddUser,
+        uid: 1,
+        ..Default::default()
+    });
+    assert_eq!(ok.result_code, CommandResultCode::Accepted);
+
+    // 这一条会让回调 panic
+    core.submit_command(OrderCommand {
+        command: OrderCommandType::AddUser,
+        uid: 2,
+        ..Default::default()
+    });
+
+    for _ in 0..300 {
+        if core.is_poisoned() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(core.is_poisoned(), "撮合线程 panic 后引擎应转入中毒状态");
+
+    // 关键：后续提交必须立刻返回，而不是自旋等一个死掉的消费者。
+    // 环形缓冲默认 64Ki，多灌几条足以证明没有被阻塞。
+    for uid in 3..200 {
+        let r = core.submit_command(OrderCommand {
+            command: OrderCommandType::AddUser,
+            uid,
+            ..Default::default()
+        });
+        assert_eq!(
+            r.result_code,
+            CommandResultCode::EnginePoisoned,
+            "中毒后应快速失败，而不是继续受理"
+        );
+    }
+}
+
+/// 中毒后不得再写 WAL —— 那些命令根本没被执行，写进去会在重放时凭空多做一遍
+#[test]
+fn poisoned_engine_stops_journaling() {
+    let dir = temp_dir("poisoned_no_journal");
+    let journal = dir.join("journal.bin");
+
+    let mut core = new_core();
+    core.enable_journaling(&journal).unwrap();
+    core.set_result_consumer(Arc::new(|cmd: &OrderCommand| {
+        if cmd.uid == 2 {
+            panic!("下游回调故意 panic");
+        }
+    }))
+    .unwrap();
+    core.startup();
+
+    add_user(&mut core, 1);
+    add_user(&mut core, 2); // 触发 panic
+
+    for _ in 0..300 {
+        if core.is_poisoned() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(core.is_poisoned());
+
+    let before = std::fs::metadata(&journal).unwrap().len();
+    for uid in 3..20 {
+        add_user(&mut core, uid);
+    }
+    core.sync_journal().unwrap();
+    let after = std::fs::metadata(&journal).unwrap().len();
+    assert_eq!(before, after, "中毒后仍在写 WAL：这些命令并未执行，重放会多做一遍");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

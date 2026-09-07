@@ -1,5 +1,7 @@
 use crate::api::*;
 use crate::core::pipeline::Pipeline;
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
@@ -94,6 +96,8 @@ pub struct ExchangeCore {
     /// 已应用到状态机的最后一条命令的全局序号。
     /// 快照按它存档，重放按它跳过前缀 —— 两者对齐，恢复才不会重复执行。
     last_seq: u64,
+    /// 撮合线程是否已中毒（曾 panic）。生产者与消费者线程共享。
+    poisoned: Arc<AtomicBool>,
 }
 
 impl ExchangeCore {
@@ -106,7 +110,16 @@ impl ExchangeCore {
             journaler: None,
             snapshot_store: None,
             last_seq: 0,
+            poisoned: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// 撮合线程是否已因 panic 进入中毒状态。
+    ///
+    /// 只在异步态下有意义：同步态的 panic 会直接沿调用栈抛给调用方，那是正确行为，
+    /// 不需要也不应该被吞掉。
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
     }
 
     /// 已应用到状态机的最后一条命令的全局序号
@@ -141,9 +154,45 @@ impl ExchangeCore {
             // 封装事件处理逻辑
             // Disruptor 3.6.1 的 handler 接收的是 &E (不可变)
             // 为了维持原有 Pipeline 的可变逻辑，我们在处理前进行克隆
+            //
+            // 这里必须兜住 panic。实测（去掉本捕获后跑
+            // panicking_consumer_poisons_engine_instead_of_aborting）：panic 逃出
+            // handler 后会在 disruptor 的析构路径上引发二次 panic，整个进程被
+            // SIGABRT 掉 —— "panic in a destructor during cleanup /
+            // thread caused non-unwinding panic. aborting."
+            //
+            // 后果不只是进程没了，而是**原始 panic 的上下文被掩盖**：最终打出来的
+            // 是析构期二次 panic 的信息，看不出是哪条命令、哪个用户触发的；
+            // WAL 也没有机会收尾。
+            //
+            // 捕获之后：线程存活并继续排空缓冲（但不再碰状态机），日志里留下
+            // 出事命令的 seq / order_id / uid，提交侧通过 poisoned 标记快速失败。
+            // 要不要进一步主动停机，交给上层按运维策略决定。
+            let poisoned = self.poisoned.clone();
             let handler = move |event: &OrderCommand, sequence: i64, end_of_batch: bool| {
+                // 已中毒：状态可能停在半更新的位置，只排空缓冲，绝不再碰状态机
+                if poisoned.load(Ordering::Acquire) {
+                    return;
+                }
+
                 let mut cmd_mut = event.clone();
-                pipeline.handle_event(&mut cmd_mut, sequence, end_of_batch);
+                // AssertUnwindSafe：pipeline 跨 catch_unwind 边界被可变借用。
+                // 这正是 UnwindSafe 要拦的情况 —— panic 后状态可能不自洽。
+                // 我们的应对不是"继续用"，而是就此中毒、不再处理任何命令。
+                let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    pipeline.handle_event(&mut cmd_mut, sequence, end_of_batch);
+                }));
+
+                if outcome.is_err() {
+                    poisoned.store(true, Ordering::Release);
+                    tracing::error!(
+                        seq = cmd_mut.seq,
+                        order_id = cmd_mut.order_id,
+                        uid = cmd_mut.uid,
+                        "撮合线程处理命令时 panic，引擎已中毒：后续命令一律拒绝，\
+                         请重启进程并从快照 + WAL 重放恢复"
+                    );
+                }
             };
 
             // 使用 build_single_producer / build_multi_producer
@@ -317,6 +366,13 @@ impl ExchangeCore {
     /// 异步模式（已 `startup()`）：命令只是投递进环形缓冲区，返回值的 `result_code`
     /// 为 `Accepted`，**真正的撮合结果只能通过 `set_result_consumer` 注册的回调获取**。
     pub fn submit_command(&mut self, mut cmd: OrderCommand) -> OrderCommand {
+        // 中毒后立刻拒绝：不写 WAL（这条命令不会被执行，写进去反而会在重放时
+        // 凭空多做一次），也不投递。
+        if self.is_poisoned() {
+            cmd.result_code = CommandResultCode::EnginePoisoned;
+            return cmd;
+        }
+
         // 控制命令不改变状态机，不写 WAL：写进去只会让每次重放都凭空多做一次快照。
         let is_control = matches!(
             cmd.command,
@@ -409,6 +465,7 @@ impl ExchangeCore {
             journaler: None,
             snapshot_store: None,
             last_seq: 0,
+            poisoned: Arc::new(AtomicBool::new(false)),
         }
     }
 }

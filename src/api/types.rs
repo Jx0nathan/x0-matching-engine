@@ -119,6 +119,14 @@ pub enum CommandResultCode {
     InvalidSymbol,
     UnsupportedSymbolType,
     BinaryCommandFailed,
+
+    /// 撮合线程曾在处理某条命令时 panic，引擎已进入中毒状态、不再执行任何命令。
+    ///
+    /// 状态可能停在半更新的位置，继续处理只会把错误扩散到资金上，因此后续命令
+    /// 一律以此码快速失败。恢复手段是重启进程并从快照 + WAL 重放。
+    ///
+    /// 追加在枚举末尾：中间插入会改变已有变体的判别值，进而破坏 WAL 中已写入的记录。
+    EnginePoisoned,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
