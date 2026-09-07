@@ -29,6 +29,19 @@ ahash = { version = "0.8.12", features = ["serde"] }
 # SIMD 向量化优化
 wide = "0.7.28"
 
+# 撮合是延迟敏感的热路径，跨 crate 内联收益明显；默认 release 不开 LTO、
+# codegen-units 还是 16，等于把这部分收益丢掉了。
+# 不设 panic="abort"：结算路径上的 expect 需要保留 unwind，
+# 以便后续在 Disruptor handler 外层用 catch_unwind 兜住消费者线程。
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+# bench 必须和 release 同档，否则测出来的数字不代表生产表现
+[profile.bench]
+lto = "fat"
+codegen-units = 1
+
 [dev-dependencies]
 criterion = "0.5.1"
 

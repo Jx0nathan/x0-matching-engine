@@ -1,3 +1,6 @@
+// 本文件刻意使用已废弃的 DirectOrderBookOptimized（缺陷清单见该类型的文档注释），
+// 保留它是为了记录现状，而不是推荐用法。
+#![allow(deprecated)]
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use matching_core::api::*;
 use matching_core::core::orderbook::{OrderBook, AdvancedOrderBook, DirectOrderBookOptimized, NaiveOrderBook};

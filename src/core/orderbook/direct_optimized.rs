@@ -1,3 +1,7 @@
+// 本模块自身的 impl 会引用这个已废弃的类型，逐处 allow 太吵，统一在模块层放开。
+// 外部使用点仍会收到废弃告警 —— 那正是我们要的。
+#![allow(deprecated)]
+
 use crate::api::*;
 use crate::core::orderbook::simd_utils::*;
 use ahash::AHashMap;
@@ -5,6 +9,11 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 type OrderIdx = usize;
+
+/// `use_simd` 不进快照，但恢复时必须回到"启用"，否则默认值 false 会静默关掉 SIMD
+fn simd_enabled_by_default() -> bool {
+    true
+}
 
 /// SOA 内存布局：订单热数据（缓存友好）
 #[derive(Clone, Serialize, Deserialize)]
@@ -88,7 +97,29 @@ struct PriceBucket {
     head: OrderIdx, // 链表头（最早订单）
 }
 
-/// 高性能撮合引擎（深度优化版）
+/// 高性能撮合引擎（深度优化版）—— **未完成，请勿使用**
+///
+/// SOA 布局与 SIMD 批量撮合的实验实现。热路径的想法是对的，但链表与价格桶的
+/// 记账整体没有维护起来，作为订单簿是不可用的。已实测确认的缺陷：
+///
+/// 1. **违反时间优先**：`insert_to_bucket` 把新单挂到 `bucket.head`，而撮合从
+///    `head` 沿 `next` 走，导致后到的订单先成交（LIFO）。
+/// 2. **价位撮合后永久失联**：撮合吃穿队首订单时只 `dealloc` 槽位，从不推进
+///    `bucket.head`。下一次撮合看到 `active[head] == false` 立即退出，该价位
+///    即使还有挂单量也再也吃不到。
+/// 3. **撤单不回写价格桶**：`cancel_order` 只释放槽位，不摘链、不减 `volume`
+///    与 `num_orders`，撤单后盘口深度直接是错的。
+/// 4. **无法序列化**：`serialize_state` 没有对应的 `OrderBookState` 变体。
+/// 5. `move_order` / `reduce_order` 未实现。
+///
+/// 修复 1–3 等于重写它的桶与链表层。在此之前不要把它接进 `MatchingEngineRouter`，
+/// 也不要拿它的 benchmark 数字与 [`DirectOrderBook`] 对比 —— 它"快"有很大一部分
+/// 来自撤单几乎不干活、以及撮合提前退出。
+///
+/// [`DirectOrderBook`]: super::DirectOrderBook
+#[deprecated(
+    note = "链表与价格桶记账未维护，存在时间优先、撮合失联、撤单不回写等缺陷；            生产路径请使用 DirectOrderBook"
+)]
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DirectOrderBookOptimized {
     symbol_spec: CoreSymbolSpecification,
@@ -100,8 +131,10 @@ pub struct DirectOrderBookOptimized {
     ask_buckets: BTreeMap<Price, PriceBucket>,
     bid_buckets: BTreeMap<Price, PriceBucket>,
     
-    // SIMD 优化开关
-    #[serde(skip)]
+    // SIMD 优化开关。不进快照（与业务状态无关），但默认值必须是 true —— 
+    // 光写 #[serde(skip)] 会让反序列化取 bool::default()，即快照恢复后
+    // SIMD 被静默关闭，性能悄悄掉一截且无任何提示。
+    #[serde(skip, default = "simd_enabled_by_default")]
     use_simd: bool,
     
     // 订单 ID 索引
@@ -690,10 +723,11 @@ impl super::OrderBook for DirectOrderBookOptimized {
     }
 
     fn serialize_state(&self) -> crate::core::orderbook::OrderBookState {
-        // 简化：暂不支持序列化优化版本
-        crate::core::orderbook::OrderBookState::Direct(
-            crate::core::orderbook::DirectOrderBook::new(self.symbol_spec.clone())
-        )
+        // 早先这里返回一个空的 DirectOrderBook —— 快照会静默丢掉全部挂单，
+        // 没有任何报错，恢复后订单簿凭空清零。而 OrderBookState 一直就有
+        // DirectOptimized 变体，MatchingEngineRouter::from_state 也早已接得住，
+        // 缺的只是这一行。
+        crate::core::orderbook::OrderBookState::DirectOptimized(self.clone())
     }
 }
 

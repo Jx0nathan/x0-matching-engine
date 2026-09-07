@@ -9,9 +9,11 @@ pub mod simd_utils;
 
 pub use naive::NaiveOrderBook;
 pub use direct::DirectOrderBook;
+#[allow(deprecated)]
 pub use direct_optimized::DirectOrderBookOptimized;
 pub use advanced::AdvancedOrderBook;
 
+#[allow(deprecated)]
 #[derive(Serialize, Deserialize)]
 pub enum OrderBookState {
     Naive(NaiveOrderBook),

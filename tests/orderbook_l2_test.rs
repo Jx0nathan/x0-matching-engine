@@ -3,6 +3,9 @@
 //! 买盘必须按价格降序（买一在前），卖盘按升序（卖一在前）。
 //! NaiveOrderBook 曾因直接遍历 BTreeMap（升序）而把买盘顺序输出反了。
 
+// 本文件刻意使用已废弃的 DirectOrderBookOptimized（缺陷清单见该类型的文档注释），
+// 保留它是为了记录现状，而不是推荐用法。
+#![allow(deprecated)]
 use matching_core::api::*;
 use matching_core::core::orderbook::{
     AdvancedOrderBook, DirectOrderBook, DirectOrderBookOptimized, NaiveOrderBook, OrderBook,

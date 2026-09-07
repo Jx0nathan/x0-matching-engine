@@ -354,6 +354,135 @@ impl DirectOrderBook {
         }
     }
 
+    /// 全簿不变量自检。仅在 debug 构建下运行，release 里被完全编译掉。
+    ///
+    /// 挂一张单要协同修改约 10 处状态（链表指针、桶记账、BTreeMap 档位、best 指针、
+    /// 哈希索引、槽位），漏掉任何一处都不会崩溃 —— 只是数字悄悄错了，或者某张订单
+    /// 从链上脱落变得既撮合不到也撤不掉。这个函数的作用就是把这类静默故障
+    /// **变成写错的那一条命令上的即时崩溃**，而不是三小时后对账时才发现。
+    #[cfg(debug_assertions)]
+    fn assert_invariants(&self) {
+        use std::collections::HashSet;
+
+        // ---- 1. 索引与槽位一一对应 ----
+        assert_eq!(
+            self.order_id_index.len(),
+            self.orders.len(),
+            "order_id_index({}) 与活跃订单数({}) 不符：有订单泄漏或索引残留",
+            self.order_id_index.len(),
+            self.orders.len()
+        );
+        for (&order_id, &idx) in &self.order_id_index {
+            let order = self
+                .orders
+                .get(idx)
+                .unwrap_or_else(|| panic!("order_id {order_id} 指向已释放的槽位 {idx}"));
+            assert_eq!(
+                order.order_id, order_id,
+                "槽位 {idx} 上的订单是 {}，索引却认为是 {order_id}（槽位被复用后未回填）",
+                order.order_id
+            );
+        }
+
+        // ---- 2. 逐桶核对：volume / num_orders / tail ----
+        for (is_ask, map) in [
+            (true, &self.ask_price_buckets),
+            (false, &self.bid_price_buckets),
+        ] {
+            for (&price, &bucket_idx) in map {
+                let bucket = &self.buckets[bucket_idx];
+                assert_eq!(bucket.price, price, "BTreeMap 键 {price} 与桶内价格不符");
+
+                // 沿 prev 走完本档，累计剩余量与笔数
+                let mut volume = 0;
+                let mut count = 0;
+                let mut cursor = self.head_of_bucket(bucket_idx, is_ask);
+                let mut last = None;
+                while let Some(idx) = cursor {
+                    let o = &self.orders[idx];
+                    if o.parent != bucket_idx {
+                        break; // 已跨出本档
+                    }
+                    assert_eq!(o.price, price, "订单 {} 挂在 {price} 档却记着价格 {}", o.order_id, o.price);
+                    assert!(o.filled <= o.size, "订单 {} 成交量超过下单量", o.order_id);
+                    volume += o.size - o.filled;
+                    count += 1;
+                    last = Some(idx);
+                    cursor = o.prev;
+                }
+
+                assert_eq!(
+                    bucket.volume, volume,
+                    "{}档 {price} 的 volume 记账错：记着 {}，实际 {volume}",
+                    if is_ask { "卖" } else { "买" }, bucket.volume
+                );
+                assert_eq!(
+                    bucket.num_orders, count,
+                    "{}档 {price} 的 num_orders 记账错：记着 {}，实际 {count}",
+                    if is_ask { "卖" } else { "买" }, bucket.num_orders
+                );
+                assert!(count > 0, "{price} 档为空却没有被删除");
+                assert_eq!(
+                    Some(bucket.tail), last,
+                    "{price} 档的 tail 不是沿 prev 走到的最后一单"
+                );
+            }
+        }
+
+        // ---- 3. 从 best 出发能遍历到全部订单，且价格单调 ----
+        let mut seen = HashSet::new();
+        for (is_ask, best) in [(true, self.best_ask_order), (false, self.best_bid_order)] {
+            let mut cursor = best;
+            let mut prev_price: Option<Price> = None;
+            while let Some(idx) = cursor {
+                assert!(
+                    seen.insert(idx),
+                    "优先级链上出现环：槽位 {idx} 被访问了两次"
+                );
+                let o = &self.orders[idx];
+                assert_eq!(
+                    o.action == OrderAction::Ask,
+                    is_ask,
+                    "订单 {} 出现在了对手方向的链上",
+                    o.order_id
+                );
+                if let Some(pp) = prev_price {
+                    // 卖盘沿 prev 价格递增，买盘递减
+                    if is_ask {
+                        assert!(o.price >= pp, "卖盘优先级链价格非递增：{pp} -> {}", o.price);
+                    } else {
+                        assert!(o.price <= pp, "买盘优先级链价格非递减：{pp} -> {}", o.price);
+                    }
+                }
+                prev_price = Some(o.price);
+                cursor = o.prev;
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            self.orders.len(),
+            "有 {} 张订单从 best 指针出发不可达 —— 它们既撮合不到也撤不掉",
+            self.orders.len() - seen.len()
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline(always)]
+    fn assert_invariants(&self) {}
+
+    /// 找到某个价格档在优先级链上的队首（自检用，O(链长)，不在热路径上）
+    #[cfg(debug_assertions)]
+    fn head_of_bucket(&self, bucket_idx: BucketIdx, is_ask: bool) -> Option<OrderIdx> {
+        let mut cursor = if is_ask { self.best_ask_order } else { self.best_bid_order };
+        while let Some(idx) = cursor {
+            if self.orders[idx].parent == bucket_idx {
+                return Some(idx);
+            }
+            cursor = self.orders[idx].prev;
+        }
+        None
+    }
+
     /// 插入订单到链表
     fn insert_order(&mut self, order_idx: OrderIdx) {
         let (price, action) = {
@@ -499,7 +628,7 @@ impl super::OrderBook for DirectOrderBook {
             return CommandResultCode::MatchingDuplicateOrderId;
         }
 
-        match cmd.order_type {
+        let code = match cmd.order_type {
             OrderType::Gtc => {
                 self.place_gtc(cmd);
                 CommandResultCode::Success
@@ -512,10 +641,10 @@ impl super::OrderBook for DirectOrderBook {
                 self.place_fok_budget(cmd);
                 CommandResultCode::Success
             }
-            _ => {
-                return CommandResultCode::MatchingUnsupportedCommand;
-            }
-        }
+            _ => CommandResultCode::MatchingUnsupportedCommand,
+        };
+        self.assert_invariants();
+        code
     }
 
     fn cancel_order(&mut self, cmd: &mut OrderCommand) -> CommandResultCode {
@@ -538,6 +667,7 @@ impl super::OrderBook for DirectOrderBook {
         cmd.action = action;
         cmd.matcher_events.push(MatcherTradeEvent::new_reject(remaining, price, reserve_price));
 
+        self.assert_invariants();
         CommandResultCode::Success
     }
 
@@ -611,6 +741,7 @@ impl super::OrderBook for DirectOrderBook {
             ));
             self.order_id_index.remove(&cmd.order_id);
             self.orders.remove(order_idx);
+            self.assert_invariants();
             return CommandResultCode::Success;
         }
 
@@ -623,6 +754,7 @@ impl super::OrderBook for DirectOrderBook {
             self.insert_order(order_idx);
         }
 
+        self.assert_invariants();
         CommandResultCode::Success
     }
 
@@ -659,6 +791,7 @@ impl super::OrderBook for DirectOrderBook {
         cmd.action = action;
         cmd.matcher_events.push(MatcherTradeEvent::new_reject(reduce_by, price, reserve_price));
 
+        self.assert_invariants();
         CommandResultCode::Success
     }
 
