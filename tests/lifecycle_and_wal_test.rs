@@ -826,3 +826,175 @@ fn poisoned_engine_stops_journaling() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ------------------------------------------------------------------ 优雅停机
+
+/// 停机必须排空在途命令，不能把环形缓冲里没消费完的丢掉。
+///
+/// 这是异步态最容易出事的地方：submit_command 只负责投递就返回，进程直接退出的话，
+/// 已受理但未消费的命令连同整个状态机一起没了。
+#[test]
+fn shutdown_drains_inflight_commands() {
+    let handled = Arc::new(AtomicUsize::new(0));
+    let handled2 = handled.clone();
+
+    let mut core = new_core();
+    // 刻意放慢消费者，保证 submit 循环跑完时缓冲里一定还有积压 ——
+    // 否则消费者天然跟得上，这个用例就证明不了"排空"这件事。
+    core.set_result_consumer(Arc::new(move |_: &OrderCommand| {
+        std::thread::sleep(std::time::Duration::from_micros(50));
+        handled2.fetch_add(1, Ordering::SeqCst);
+    }))
+    .unwrap();
+    core.startup();
+
+    const N: u64 = 500;
+    for uid in 1..=N {
+        core.submit_command(OrderCommand {
+            command: OrderCommandType::AddUser,
+            uid,
+            ..Default::default()
+        });
+    }
+
+    let before_shutdown = handled.load(Ordering::SeqCst) as u64;
+    assert!(
+        before_shutdown < N,
+        "停机前消费者已全部处理完（{before_shutdown}/{N}），本用例无法验证排空；\
+         请调慢消费者或加大 N"
+    );
+
+    // 不等待、直接停机：排空由 shutdown 负责
+    core.shutdown().expect("停机失败");
+
+    assert_eq!(
+        handled.load(Ordering::SeqCst) as u64,
+        N + 1,
+        "在途命令被丢弃（停机前才处理了 {before_shutdown} 条；\
+         应为 N 条业务命令 + 1 条 ShutdownSignal 全部处理完）"
+    );
+    assert!(core.is_stopped());
+}
+
+/// 停机时落最终快照：状态活在撮合线程的闭包里，线程一走就没了
+#[test]
+fn shutdown_takes_final_snapshot_and_state_survives() {
+    let dir = temp_dir("shutdown_snapshot");
+    let journal = dir.join("journal.bin");
+    let snaps = dir.join("snapshots");
+
+    {
+        let mut core = new_core();
+        core.enable_journaling(&journal).unwrap();
+        core.enable_snapshotting(&snaps).unwrap();
+        core.startup();
+
+        core.submit_command(OrderCommand {
+            command: OrderCommandType::AddUser,
+            uid: 1,
+            ..Default::default()
+        });
+        core.submit_command(OrderCommand {
+            command: OrderCommandType::BalanceAdjustment,
+            uid: 1,
+            symbol: 1,
+            price: 4_200,
+            order_id: 1,
+            ..Default::default()
+        });
+
+        core.shutdown().expect("停机失败");
+
+        // 停机后一律拒绝，且必须是"已停机"而不是"中毒"
+        let rejected = core.submit_command(OrderCommand {
+            command: OrderCommandType::AddUser,
+            uid: 99,
+            ..Default::default()
+        });
+        assert_eq!(rejected.result_code, CommandResultCode::EngineStopped);
+        assert!(core.shutdown().is_ok(), "重复停机应当幂等");
+    }
+
+    // 快照档案号应停在最后一条业务命令上（ShutdownSignal 不入 WAL、不占序号）
+    let store = matching_core::core::snapshot::SnapshotStore::new(&snaps).unwrap();
+    assert_eq!(store.get_latest_seq_id().unwrap(), Some(2));
+
+    // 只靠快照即可完整恢复，日志无需再重放
+    let mut restored = new_core();
+    restored.enable_snapshotting(&snaps).unwrap();
+    assert!(restored.load_latest_snapshot().unwrap());
+    assert_eq!(
+        restored.balance_of(1, 1).unwrap(),
+        4_200,
+        "停机快照未包含完整状态"
+    );
+    let summary = restored.replay_journal(&journal).expect("重放失败");
+    assert_eq!(summary.replayed, 0, "最终快照已覆盖全部命令，不该再重放");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 中毒后停机不得落快照：状态可能停在半更新的位置，存下去等于把损坏固化
+#[test]
+fn shutdown_after_poison_does_not_snapshot() {
+    let dir = temp_dir("shutdown_poisoned");
+    let snaps = dir.join("snapshots");
+
+    let mut core = new_core();
+    core.enable_snapshotting(&snaps).unwrap();
+    core.set_result_consumer(Arc::new(|cmd: &OrderCommand| {
+        if cmd.uid == 2 {
+            panic!("下游回调故意 panic");
+        }
+    }))
+    .unwrap();
+    core.startup();
+
+    add_user(&mut core, 1);
+    add_user(&mut core, 2); // 触发 panic
+
+    for _ in 0..300 {
+        if core.is_poisoned() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(core.is_poisoned());
+
+    core.shutdown().expect("中毒后停机仍应成功返回");
+
+    let store = matching_core::core::snapshot::SnapshotStore::new(&snaps).unwrap();
+    assert_eq!(
+        store.get_latest_seq_id().unwrap(),
+        None,
+        "中毒后不应写出快照 —— 那会把可能已损坏的状态固化下来"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 同步态也要能停机：没有消费者线程，但快照与 WAL 收尾照做
+#[test]
+fn shutdown_works_in_sync_mode() {
+    let dir = temp_dir("shutdown_sync");
+    let journal = dir.join("journal.bin");
+    let snaps = dir.join("snapshots");
+
+    let mut core = new_core();
+    core.enable_journaling(&journal).unwrap();
+    core.enable_snapshotting(&snaps).unwrap();
+    add_user(&mut core, 1);
+
+    core.shutdown().expect("同步态停机失败");
+    assert!(core.is_stopped());
+
+    let store = matching_core::core::snapshot::SnapshotStore::new(&snaps).unwrap();
+    assert_eq!(store.get_latest_seq_id().unwrap(), Some(1));
+
+    let rejected = core.submit_command(OrderCommand {
+        command: OrderCommandType::AddUser,
+        uid: 2,
+        ..Default::default()
+    });
+    assert_eq!(rejected.result_code, CommandResultCode::EngineStopped);
+    let _ = std::fs::remove_dir_all(&dir);
+}

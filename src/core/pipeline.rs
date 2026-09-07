@@ -44,6 +44,22 @@ impl Pipeline {
             return;
         }
 
+        // 停机信号：本线程即将随 Disruptor 一起退出，而 pipeline 就活在那个闭包里 ——
+        // 线程一走状态就没了。所以这里必须趁最后的机会落一份快照，否则下次启动
+        // 只能从上一个检查点重放整段 WAL。
+        if cmd.command == OrderCommandType::ShutdownSignal {
+            if self.snapshot_sink.is_some() {
+                self.persist_state(cmd);
+            } else {
+                // 没启用快照不算错：无状态可存，停机本身仍然成立
+                cmd.result_code = CommandResultCode::Success;
+            }
+            if let Some(consumer) = &self.result_consumer {
+                consumer(cmd);
+            }
+            return;
+        }
+
         // 1. Risk R1 (预处理)
         for engine in &mut self.risk_engines {
             engine.pre_process(cmd);

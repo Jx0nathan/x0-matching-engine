@@ -127,6 +127,12 @@ pub enum CommandResultCode {
     ///
     /// 追加在枚举末尾：中间插入会改变已有变体的判别值，进而破坏 WAL 中已写入的记录。
     EnginePoisoned,
+
+    /// 引擎已停机（shutdown 已执行完毕），不再受理任何命令。
+    ///
+    /// 与 EnginePoisoned 的区别：这是正常终态，状态一致且已落最终快照；
+    /// 中毒则是异常终态，状态可能停在半更新的位置。
+    EngineStopped,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]

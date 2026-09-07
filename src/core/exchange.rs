@@ -98,6 +98,8 @@ pub struct ExchangeCore {
     last_seq: u64,
     /// 撮合线程是否已中毒（曾 panic）。生产者与消费者线程共享。
     poisoned: Arc<AtomicBool>,
+    /// 是否已执行过 shutdown()。停机后不再受理任何命令。
+    stopped: bool,
 }
 
 impl ExchangeCore {
@@ -111,7 +113,63 @@ impl ExchangeCore {
             snapshot_store: None,
             last_seq: 0,
             poisoned: Arc::new(AtomicBool::new(false)),
+            stopped: false,
         }
+    }
+
+    /// 引擎是否已停机
+    pub fn is_stopped(&self) -> bool {
+        self.stopped
+    }
+
+    /// 优雅停机：排空在途命令 → 落最终快照 → WAL 落盘。
+    ///
+    /// 异步态下这一步是必须的。`startup()` 把 pipeline 移交给了 Disruptor 消费者线程，
+    /// 状态就活在那个闭包里；进程直接退出的话，环形缓冲里尚未消费的命令**连同整个
+    /// 状态机一起丢掉**，下次启动只能从上一个检查点重放整段 WAL。
+    ///
+    /// 执行顺序（每一步都有理由，不能调换）：
+    ///
+    /// 1. 置 `stopped`，此后 `submit_command` 一律拒绝 —— 先关门，才谈得上排空
+    /// 2. 投递 `ShutdownSignal`。它是最后一条命令，消费者处理到它时落最终快照
+    /// 3. drop producer。disruptor 的 `Drop` 会把 `shutdown_at_sequence` 定在最后一条
+    ///    已发布序号上再 join 消费者线程 —— 也就是说**在途命令保证被处理完**，
+    ///    包括上一步那条 ShutdownSignal。join 返回时快照已经落盘
+    /// 4. WAL fsync 收尾
+    ///
+    /// 重复调用是幂等的。同步态下没有消费者线程，只做第 2、4 步。
+    ///
+    /// 停机后 WAL 已被最终快照完全覆盖，可再调 [`compact_journal`] 把它清空，
+    /// 让下次启动几乎无需重放。这里不自动做，是为了把"丢弃日志"这个动作留给调用方决定。
+    ///
+    /// [`compact_journal`]: Self::compact_journal
+    pub fn shutdown(&mut self) -> anyhow::Result<()> {
+        if self.stopped {
+            return Ok(()); // 幂等
+        }
+        self.stopped = true;
+
+        // 中毒时状态可能停在半更新的位置，落快照只会把损坏固化下来
+        if !self.is_poisoned() {
+            let mut cmd = OrderCommand {
+                command: OrderCommandType::ShutdownSignal,
+                seq: self.last_seq,
+                ..Default::default()
+            };
+            if let Some(producer) = &mut self.producer {
+                producer.publish(cmd);
+            } else if let Some(pipeline) = &mut self.pipeline {
+                pipeline.handle_event(&mut cmd, 0, true);
+            }
+        }
+
+        // drop 触发 disruptor 的排空 + join；join 返回即代表 ShutdownSignal 已被处理完
+        self.producer = None;
+
+        if let Some(j) = &mut self.journaler {
+            j.sync()?;
+        }
+        Ok(())
     }
 
     /// 撮合线程是否已因 panic 进入中毒状态。
@@ -366,6 +424,13 @@ impl ExchangeCore {
     /// 异步模式（已 `startup()`）：命令只是投递进环形缓冲区，返回值的 `result_code`
     /// 为 `Accepted`，**真正的撮合结果只能通过 `set_result_consumer` 注册的回调获取**。
     pub fn submit_command(&mut self, mut cmd: OrderCommand) -> OrderCommand {
+        // 已停机：正常终态，直接拒绝。放在中毒判断之前 —— 停机是调用方主动发起的，
+        // 应当优先反馈这个更准确的原因。
+        if self.stopped {
+            cmd.result_code = CommandResultCode::EngineStopped;
+            return cmd;
+        }
+
         // 中毒后立刻拒绝：不写 WAL（这条命令不会被执行，写进去反而会在重放时
         // 凭空多做一次），也不投递。
         if self.is_poisoned() {
@@ -466,6 +531,7 @@ impl ExchangeCore {
             snapshot_store: None,
             last_seq: 0,
             poisoned: Arc::new(AtomicBool::new(false)),
+            stopped: false,
         }
     }
 }
