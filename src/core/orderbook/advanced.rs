@@ -1,3 +1,62 @@
+//! 高级订单类型的实验实现（Stop / Iceberg / GTD / PostOnly）。
+//!
+//! # 现状：未接入引擎，请勿在生产路径使用
+//!
+//! `MatchingEngineRouter::add_symbol` 一律创建 [`DirectOrderBook`]，本类型从引擎里
+//! 到不了。本文件的单测大多直接构造 `AdvancedOrderBook`、绕过 `ExchangeCore`，
+//! 因此**测试全绿不代表引擎支持这些订单类型** —— 引擎实际只认
+//! Gtc / Ioc / FokBudget 三种，边界见 `tests/advanced_orders_test.rs` 末尾两个用例。
+//!
+//! # 定位
+//!
+//! 它是 **NaiveOrderBook + 功能**，不是 DirectOrderBook 的进化：档内仍是
+//! `SmallVec<[AdvancedOrder; 8]>`，撤单要 `iter().position()` 线性扫描，
+//! 没有任何性能追求。与之相对，`direct_optimized` 走的是纯性能路线（SOA + SIMD）
+//! 但功能更少且已废弃。当前局面是"快的没功能，有功能的慢"。
+//!
+//! # 已核实的缺陷（都会造成资金问题，接入前必须先修）
+//!
+//! 1. **GTD 过期不退款**：`AdvancedBucket::match_order` 里过期订单只被推进
+//!    `to_remove` 就 `continue`，不产生任何 Reject 事件。R2 收不到事件就不退款，
+//!    用户为该单冻结的资金被永久锁死。
+//!    另外过期检查只在该档**被撮合时**才跑，无人问津的档位上的过期单永远不会被清理。
+//! 2. **止损触发后成交事件被丢弃**：`process_stop_orders` 里的 `activate_cmd` 是局部
+//!    变量，`place_order_internal` 把成交写进它的 `matcher_events` 后随函数返回一起丢掉，
+//!    从未并回外层 `cmd.matcher_events`。结果是订单簿状态变了、钱没结算 —— 账实分离。
+//! 3. **冰山单没有切片轮转**：只维护了 `visible_volume`，露出的一片吃完后不会把下一片
+//!    重新排到队尾，实际效果是"隐藏单"而非冰山单。
+//! 4. **止损扫描是 O(全部止损单)**：`stop_orders: Vec<_>` 每次成交全量遍历。
+//!
+//! # 若日后要正经支持这些订单类型，建议的方向
+//!
+//! **不要重做订单簿模型，在 [`DirectOrderBook`] 旁边挂卫星结构即可**：
+//!
+//! - **冰山单**：核心结构完全不用改。订单照常待在同一条链、同一档、同一排队位置；
+//!   只需订单上加 `visible_size`、档位上加 `visible_volume`，行情报后者。
+//!   切片轮转用现成的 `remove_order` + `insert_order` 就能实现（露出的一片吃完后
+//!   下一片重新排到队尾），正是 `move_order` 用的那条路径。
+//! - **GTD / Day**：加一张按过期时间排序的索引 `BTreeMap<Timestamp, Vec<OrderId>>`，
+//!   配时钟 tick 扫队首。订单簿本身无需感知。移除时**必须发 Reject 事件**，否则就是
+//!   上面第 1 条。
+//! - **止损单**：触发前它根本不在簿里，需要独立的触发索引
+//!   `BTreeMap<Price, Vec<StopOrder>>`（买止损与卖止损各一），成交后按最新成交价
+//!   只取该动的那批，O(被触发数) 而非 O(全部)。
+//! - **额外字段旁挂，别塞进 `DirectOrder`**：那个结构体在热路径上每条命令都要读，
+//!   为少数特殊单撑大它会拖累绝大多数普通单的缓存局部性。用
+//!   `AHashMap<OrderIdx, OrderExtras>` 之类只为特殊单建条目即可
+//!   （`direct_optimized` 的冷热分离思路是对的，只是那份实现的链表记账写坏了）。
+//!
+//! # 真正的难点不在数据结构
+//!
+//! 止损单会**在撮合过程中凭空产生新的撮合活动**：触发后的单立刻去吃盘口，这次成交
+//! 又可能触发别的止损，形成级联。需要定死递归深度上限与处理顺序，并保证所有派生成交的
+//! 事件都并回同一条命令，R2 才能正确结算。
+//!
+//! 还有一个风控决策：本仓库 R1 在**下单时**冻结资金，而止损单触发前不占盘口 ——
+//! 它的钱是下单即冻，还是触发才冻？这是 `RiskEngine` 的设计问题，不是订单簿的。
+//!
+//! [`DirectOrderBook`]: super::DirectOrderBook
+
 use crate::api::*;
 use ahash::AHashMap;
 use std::collections::BTreeMap;
