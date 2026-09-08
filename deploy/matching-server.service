@@ -1,0 +1,58 @@
+# 撮合引擎 systemd unit
+#
+# 安装：
+#   sudo useradd --system --create-home --home-dir /var/lib/matching matching
+#   sudo install -m755 target/release/matching-server /usr/local/bin/
+#   sudo install -m644 deploy/matching-server.service /etc/systemd/system/
+#   sudo install -m600 -o matching deploy/matching-server.env.example /etc/matching-server.env
+#   sudo systemctl daemon-reload && sudo systemctl enable --now matching-server
+
+[Unit]
+Description=Matching engine service
+Documentation=https://github.com/Jx0nathan/x0-matching-engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=matching
+Group=matching
+WorkingDirectory=/var/lib/matching
+
+EnvironmentFile=-/etc/matching-server.env
+Environment=DATA_DIR=/var/lib/matching/data
+ExecStart=/usr/local/bin/matching-server
+
+Restart=on-failure
+RestartSec=2s
+
+# --- 停机 ---
+# 撮合是单线程内存状态机，停机要排空在途命令并写最终快照。超时会被 SIGKILL，
+# 届时在途命令与整个内存状态一起丢失，重启只能从上一个检查点重放整段 WAL。
+# 订单簿越大快照越久，按实际规模上调。
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=120
+
+# --- 资源 ---
+LimitNOFILE=65535
+# BusySpin 会把一个 CPU 核吃满到 100%（wait_strategy 配置项当前不生效，
+# startup() 里硬编码了 BusySpin）。要固定核心可解开下面两行：
+# CPUAffinity=2
+# Nice=-10
+
+# --- 加固 ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+# ProtectSystem=strict 下整个文件系统只读，必须显式放开数据目录
+ReadWritePaths=/var/lib/matching
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+# 构建产物有 2GB 量级，必须排除，否则 build context 会把它整个传给 daemon
+target/
+data/
+
+.git/
+.gitignore
+.idea/
+.DS_Store
+
+# 文档与素材不参与构建
+*.md
+!README.md
+benchmark_results.csv
+scripts/

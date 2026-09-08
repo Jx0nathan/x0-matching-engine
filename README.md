@@ -373,3 +373,33 @@ cargo run --release --bin matching-server
 - **WAL_SYNC 是吞吐旋钮**：EBS 上单次 fsync 约 0.5–1ms，`always` 会把吞吐压到千级/秒；`64` 则崩溃最多丢 63 条。
 - **必须让 SIGTERM 走到停机流程**：进程被硬杀时，在途命令与整个内存状态一起丢失。容器/systemd 的停止超时要留够写快照的时间。
 - 数据卷不可随实例销毁（WAL 与快照在上面），重建后重新挂载即可自动恢复。
+
+### 容器部署
+
+```bash
+docker build -t matching-server .
+docker run -d --name matching \
+  -p 8080:8080 \
+  -v matching-data:/data \
+  --stop-timeout 120 \
+  matching-server
+```
+
+`--stop-timeout` 不能省。Docker 默认只给 10 秒，而停机要排空在途命令并写最终快照；
+超时会被 SIGKILL，届时在途命令与整个内存状态一起丢失。订单簿越大越要放宽。
+
+数据卷 `/data` 承载 WAL 与快照，容器重建后必须挂回同一个卷才能恢复状态。
+
+### systemd 部署
+
+```bash
+sudo useradd --system --create-home --home-dir /var/lib/matching matching
+sudo install -m755 target/release/matching-server /usr/local/bin/
+sudo install -m644 deploy/matching-server.service /etc/systemd/system/
+sudo install -m600 -o matching deploy/matching-server.env.example /etc/matching-server.env
+sudo systemctl daemon-reload && sudo systemctl enable --now matching-server
+```
+
+unit 里几个关键项：`TimeoutStopSec=120` 给停机留足写快照的时间；
+`ProtectSystem=strict` 下文件系统只读，靠 `ReadWritePaths=/var/lib/matching` 放开数据目录；
+`CPUAffinity` 默认注释掉，需要把撮合线程钉在专用核上时解开。
