@@ -70,14 +70,18 @@ pub struct ReplaySummary {
 
 use crate::core::snapshot::SnapshotStore;
 
-/// 内部接口，用于类型抹除 Disruptor 的泛型 Producer
-trait Publisher {
+/// 内部接口，用于类型抹除 Disruptor 的泛型 Producer。
+///
+/// `: Send` 是必需的：没有它 `Box<dyn Publisher>` 不是 Send，整个 `ExchangeCore`
+/// 也就不是 Send —— 而这个引擎是单线程状态机，典型用法恰恰是把它整个搬到一条
+/// 专用线程上跑（服务外壳就是这么做的）。
+trait Publisher: Send {
     fn publish(&mut self, cmd: OrderCommand);
 }
 
 struct ProducerWrapper<P: disruptor::Producer<OrderCommand>>(P);
 
-impl<P: disruptor::Producer<OrderCommand>> Publisher for ProducerWrapper<P> {
+impl<P: disruptor::Producer<OrderCommand> + Send> Publisher for ProducerWrapper<P> {
     fn publish(&mut self, cmd: OrderCommand) {
         self.0.publish(|event| {
             *event = cmd;
@@ -404,6 +408,14 @@ impl ExchangeCore {
             p.add_symbol(spec);
         }
         Ok(())
+    }
+
+    /// 取某个交易对的 L2 盘口深度。
+    ///
+    /// 与 `balance_of` 同理：`startup()` 之后 pipeline 已移交撮合线程，这里返回 None。
+    /// 异步态下要拿盘口，需通过带内命令或结果回调自行维护一份投影。
+    pub fn l2_depth(&self, symbol: SymbolId, depth: usize) -> Option<L2MarketData> {
+        self.pipeline.as_ref().and_then(|p| p.l2_depth(symbol, depth))
     }
 
     /// 查询用户可用余额。`startup()` 之后 pipeline 移交给 Disruptor 线程，返回 None。

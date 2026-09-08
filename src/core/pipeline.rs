@@ -151,6 +151,13 @@ impl Pipeline {
         self.result_consumer = Some(consumer);
     }
 
+    /// 取某个交易对的 L2 深度。每个交易对只归属一个撮合分片。
+    pub fn l2_depth(&self, symbol: SymbolId, depth: usize) -> Option<L2MarketData> {
+        self.matching_engines
+            .iter()
+            .find_map(|e| e.l2_depth(symbol, depth))
+    }
+
     /// 查询用户可用余额。每个 uid 只归属一个风控分片，其余分片返回 0。
     pub fn balance_of(&self, uid: UserId, currency: Currency) -> i64 {
         self.risk_engines.iter().map(|e| e.balance_of(uid, currency)).sum()

@@ -18,7 +18,7 @@ smallvec = { version = "1.13", features = ["serde"] }
 
 # 日志
 tracing = "0.1.41"
-tracing-subscriber = "0.3.19"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }  # env-filter: 支持 RUST_LOG
 tracing-appender = "0.2.3" # 异步日志
 
 # 高性能对象池 (替代 Eclipse Collections 中的 Pool)
@@ -28,6 +28,11 @@ ahash = { version = "0.8.12", features = ["serde"] }
 
 # SIMD 向量化优化
 wide = "0.7.28"
+
+# --- 服务外壳（bin: matching-server）。撮合内核本身不依赖它们 ---
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
+axum = "0.8"
+serde_json = "1"
 
 # 撮合是延迟敏感的热路径，跨 crate 内联收益明显；默认 release 不开 LTO、
 # codegen-units 还是 16，等于把这部分收益丢掉了。
@@ -44,6 +49,10 @@ codegen-units = 1
 
 [dev-dependencies]
 criterion = "0.5.1"
+
+[[bin]]
+name = "matching-server"
+path = "src/bin/server.rs"
 
 [[bench]]
 name = "exchange_bench"

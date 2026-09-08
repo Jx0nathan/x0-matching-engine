@@ -66,6 +66,14 @@ impl MatchingEngineRouter {
         self.order_books.insert(spec.symbol_id, Box::new(DirectOrderBook::new(spec)));
     }
 
+    /// 取某个交易对的 L2 深度。不属于本分片、或该交易对未注册时返回 None。
+    pub fn l2_depth(&self, symbol: SymbolId, depth: usize) -> Option<L2MarketData> {
+        if !self.symbol_for_this_shard(symbol) {
+            return None;
+        }
+        self.order_books.get(&symbol).map(|b| b.get_l2_data(depth))
+    }
+
     pub fn process_order(&mut self, cmd: &mut OrderCommand) {
         // 如果已经有结果码（测试用），跳过撮合
         if cmd.result_code == CommandResultCode::Success {

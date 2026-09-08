@@ -335,3 +335,41 @@ cargo test --test edge_cases_test --release
 ## 提示
 - 这个项目是从生产上copy出来的，只有大致的逻辑，并没有经过生产环境的检验，仅供学习。
 
+
+## 服务外壳（matching-server）
+
+`ExchangeCore` 是一个库，本身没有网络层。`src/bin/server.rs` 把它包成可部署的 HTTP 服务。
+
+```bash
+cargo run --release --bin matching-server
+```
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `BIND` | `0.0.0.0:8080` | 监听地址 |
+| `DATA_DIR` | `./data` | WAL 与快照目录 |
+| `WAL_SYNC` | `64` | 每 N 条 fsync 一次；`always` 每条都刷，`never` 不主动刷 |
+| `SYMBOLS` | `1:0:1` | `symbol_id:base:quote`，逗号分隔 |
+| `RUST_LOG` | `info` | 日志级别 |
+
+接口：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/health` | 引擎状态（ok / poisoned / stopped）与当前序号 |
+| POST | `/users` | `{uid}` 开户 |
+| POST | `/balances` | `{uid, currency, amount, transaction_id}` 出入金，金额可负 |
+| GET | `/balances/{uid}/{currency}` | 查余额 |
+| POST | `/orders` | `{uid, order_id, symbol, price, size, side, order_type?, reserve_price?}` |
+| DELETE | `/orders/{order_id}` | `{uid, symbol}` 撤单 |
+| POST | `/orders/{order_id}/reduce` | `{uid, symbol, size}` 减量 |
+| GET | `/depth?symbol=1&limit=10` | L2 盘口（含每档笔数） |
+| POST | `/admin/checkpoint` | 落快照并压缩 WAL 前缀 |
+
+部署要点：
+
+- **单写者**：撮合是单线程状态机，同一批交易对全局只能跑一个实例。不要放在负载均衡后面多副本，那会把订单簿劈成两份。扩容靠按交易对拆实例。
+- **`transaction_id` 必须按用户严格递增**，它是出入金的幂等键；小于等于历史值会被判为重复并忽略。
+- **WAL_SYNC 是吞吐旋钮**：EBS 上单次 fsync 约 0.5–1ms，`always` 会把吞吐压到千级/秒；`64` 则崩溃最多丢 63 条。
+- **必须让 SIGTERM 走到停机流程**：进程被硬杀时，在途命令与整个内存状态一起丢失。容器/systemd 的停止超时要留够写快照的时间。
+- 数据卷不可随实例销毁（WAL 与快照在上面），重建后重新挂载即可自动恢复。
