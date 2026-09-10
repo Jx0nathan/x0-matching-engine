@@ -1,0 +1,931 @@
+{
+  "info": {
+    "name": "Matching Engine · matching-server",
+    "description": "撮合引擎 HTTP 接口（`src/bin/server.rs`）。\n\n## 快速开始\n\n1. 启动服务：`docker run -d -p 8080:8080 -v matching-data:/data --stop-timeout 120 matching-server`\n2. 导入本集合，确认变量 `baseUrl` 指向你的服务\n3. 用 Collection Runner **从上往下整份运行**——各文件夹之间有依赖顺序（先开户入金，才能下单）\n\n集合内的 `order_id` 与 `transaction_id` 由 Pre-request Script 基于时间戳自动生成，因此可以反复运行而不会撞重复。\n\n## 需要知道的三件事\n\n- **单写者**：撮合是单线程状态机，同一批交易对全局只能跑一个实例。不要放在负载均衡后面做多副本，那会把订单簿劈成两份。\n- **`transaction_id` 必须按用户严格递增**：它是出入金的幂等键，小于等于历史值的会被静默忽略。\n- **订单类型只支持 `gtc` / `ioc` / `fok_budget`**：其余 8 种（fok / post_only / stop_limit / iceberg / gtd 等）尚未接入引擎。\n\n## 结果码速查\n\n| result_code | 含义 |\n|---|---|\n| `Success` | 成功 |\n| `RiskNsf` | 余额不足，风控拒绝 |\n| `RiskInvalidOrderParams` | size/price 非正数等非法入参 |\n| `MatchingDuplicateOrderId` | order_id 已存在 |\n| `MatchingUnknownOrderId` | 订单不存在或不属于该 uid |\n| `MatchingUnsupportedCommand` | 订单类型未接入 |\n| `UserMgmtDuplicateTransaction` | 流水号重复，已忽略 |\n| `EnginePoisoned` | 撮合线程曾 panic，引擎已停止处理 |\n| `EngineStopped` | 已优雅停机 |\n",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "00 · 运维",
+      "item": [
+        {
+          "name": "健康检查",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "health"
+              ]
+            },
+            "description": "返回引擎状态与当前命令序号。\n\n- `status`: `ok` / `poisoned`（撮合线程曾 panic，已停止处理）/ `stopped`（已优雅停机）\n- `last_seq`: 已应用到状态机的最后一条命令序号，也是快照的档案号\n- `started`: 是否处于 Disruptor 异步态（当前服务外壳固定为同步态，恒为 false）"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('引擎状态为 ok', () => pm.expect(j.status).to.eql('ok'));",
+                  "pm.collectionVariables.set('lastSeq', j.last_seq);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "检查点（落快照 + 压缩 WAL）",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/admin/checkpoint",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "admin",
+                "checkpoint"
+              ]
+            },
+            "description": "先写一份快照，再丢弃已被它覆盖的 WAL 前缀，返回回收的字节数。\n\n生产上应周期性调用：不做的话 WAL 只增不减，恢复时间会线性增长。\n**注意**：序列化在撮合线程内同步完成，期间不处理新命令，是一次 stop-the-world 停顿，时长随订单簿规模增长。"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('返回回收字节数', () => pm.expect(j).to.have.property('reclaimed_bytes'));",
+                  "console.log('WAL 回收 ' + j.reclaimed_bytes + ' 字节');"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "01 · 账户",
+      "item": [
+        {
+          "name": "开户 · 卖方",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/users",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "users"
+              ]
+            },
+            "description": "创建用户档案。重复开户返回 `UserMgmtUserAlreadyExists`（本用例视为可接受，便于反复运行）。",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"uid\": {{sellerUid}}\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('命令被受理', function () {",
+                  "    const allowed = [\"UserMgmtUserAlreadyExists\"];",
+                  "    if (!j.accepted && allowed.indexOf(j.result_code) < 0) {",
+                  "        pm.expect.fail('result_code = ' + j.result_code);",
+                  "    }",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "开户 · 买方",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/users",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "users"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"uid\": {{buyerUid}}\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('命令被受理', function () {",
+                  "    const allowed = [\"UserMgmtUserAlreadyExists\"];",
+                  "    if (!j.accepted && allowed.indexOf(j.result_code) < 0) {",
+                  "        pm.expect.fail('result_code = ' + j.result_code);",
+                  "    }",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "入金 · 卖方收 base",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/balances",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "balances"
+              ]
+            },
+            "description": "出入金。`amount` 为正是入金、为负是出金（出金不得把余额做成负数）。\n\n⚠️ `transaction_id` 是**幂等键，必须按用户严格递增**。小于等于该用户历史值的会被直接忽略并返回 `UserMgmtDuplicateTransaction`。\n这是 WAL 重放与上游消息重投的去重保障，接入方必须能保证单调递增。\n\n本请求的 Pre-request Script 用毫秒时间戳自动生成，因此可反复运行。",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"uid\": {{sellerUid}},\n  \"currency\": {{baseCcy}},\n  \"amount\": 1000,\n  \"transaction_id\": {{txId}}\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// transaction_id 必须按用户严格递增，否则会被幂等闸门判为重复而忽略。",
+                  "// 用毫秒时间戳，天然单调，重复运行也不会撞。",
+                  "pm.collectionVariables.set('txId', Date.now());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('命令被受理', function () {",
+                  "    const allowed = [];",
+                  "    if (!j.accepted && allowed.indexOf(j.result_code) < 0) {",
+                  "        pm.expect.fail('result_code = ' + j.result_code);",
+                  "    }",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "入金 · 买方收 quote",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/balances",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "balances"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"uid\": {{buyerUid}},\n  \"currency\": {{quoteCcy}},\n  \"amount\": 1000000,\n  \"transaction_id\": {{txId}}\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// transaction_id 必须按用户严格递增，否则会被幂等闸门判为重复而忽略。",
+                  "// 用毫秒时间戳，天然单调，重复运行也不会撞。",
+                  "pm.collectionVariables.set('txId', Date.now());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('命令被受理', function () {",
+                  "    const allowed = [];",
+                  "    if (!j.accepted && allowed.indexOf(j.result_code) < 0) {",
+                  "        pm.expect.fail('result_code = ' + j.result_code);",
+                  "    }",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "查余额 · 卖方 base",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/balances/{{sellerUid}}/{{baseCcy}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "balances",
+                "{{sellerUid}}",
+                "{{baseCcy}}"
+              ]
+            },
+            "description": "查询某用户某币种的**可用**余额（已冻结的部分不计入）。"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('余额为正', () => pm.expect(j.available).to.be.above(0));",
+                  "console.log('卖方 base 可用: ' + j.available);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "查余额 · 买方 quote",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/balances/{{buyerUid}}/{{quoteCcy}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "balances",
+                "{{buyerUid}}",
+                "{{quoteCcy}}"
+              ]
+            },
+            "description": ""
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "console.log('买方 quote 可用: ' + j.available);"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "02 · 交易",
+      "item": [
+        {
+          "name": "挂卖单 10 手（独立价位）",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/orders",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orders"
+              ]
+            },
+            "description": "下单。\n\n- `side`: `buy`/`bid` 或 `sell`/`ask`\n- `order_type`: 引擎只支持 `gtc` / `ioc` / `fok_budget`，其余类型返回 `MatchingUnsupportedCommand`（冻结资金会原样退回）\n- `reserve_price`: 买单的冻结价，缺省等于 `price`；不得低于委托价\n\n`order_id` 全局唯一，重复会被拒。本用例由脚本自动生成。",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"uid\": {{sellerUid}},\n  \"order_id\": {{askOrderId}},\n  \"symbol\": {{symbol}},\n  \"price\": {{px}},\n  \"size\": 10,\n  \"side\": \"sell\",\n  \"order_type\": \"gtc\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// order_id 全局唯一，重复下单会被拒（MatchingDuplicateOrderId）",
+                  "pm.collectionVariables.set('askOrderId', Date.now() % 1000000000);",
+                  "// 每次运行挑一个独立价位，使断言不受簿中既有挂单干扰",
+                  "pm.collectionVariables.set('px', 1000 + (Date.now() % 5000));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('命令被受理', function () {",
+                  "    const allowed = [];",
+                  "    if (!j.accepted && allowed.indexOf(j.result_code) < 0) {",
+                  "        pm.expect.fail('result_code = ' + j.result_code);",
+                  "    }",
+                  "});",
+                  "pm.test('未成交，全部挂入簿中', () => pm.expect(j.events.length).to.eql(0));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "查盘口（本次价位应出现）",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/depth?symbol={{symbol}}&limit=10",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "depth"
+              ],
+              "query": [
+                {
+                  "key": "symbol",
+                  "value": "{{symbol}}"
+                },
+                {
+                  "key": "limit",
+                  "value": "10"
+                }
+              ]
+            },
+            "description": ""
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "const px = Number(pm.collectionVariables.get('px'));",
+                  "const lvl = j.asks.find(a => a.price === px);",
+                  "pm.test('本次挂单的价位出现在盘口', () => pm.expect(lvl).to.not.be.undefined);",
+                  "pm.test('该档数量为 10', () => pm.expect(lvl.size).to.eql(10));",
+                  "console.log('本次价位 ' + px + ' -> ' + JSON.stringify(lvl));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "买单吃掉 3 手（部分成交）",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/orders",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orders"
+              ]
+            },
+            "description": "买 3 手，返回 `Trade` 事件。`events` 里每条含成交量、成交价、对手单号与对手 uid。\n\n**注意价格优先**：买单从最优（最低）卖价开始吃，成交价必然不高于委托价。若簿中存在比本次价位更便宜的卖单，会先被吃掉，因此成交对手不一定是上一步挂的那张。断言据此只校验成交总量与价格上界。",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"uid\": {{buyerUid}},\n  \"order_id\": {{bidOrderId}},\n  \"symbol\": {{symbol}},\n  \"price\": {{px}},\n  \"size\": 3,\n  \"side\": \"buy\",\n  \"order_type\": \"gtc\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('bidOrderId', (Date.now() % 1000000000) + 1);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('命令被受理', function () {",
+                  "    const allowed = [];",
+                  "    if (!j.accepted && allowed.indexOf(j.result_code) < 0) {",
+                  "        pm.expect.fail('result_code = ' + j.result_code);",
+                  "    }",
+                  "});",
+                  "pm.test('产生成交事件，成交量合计 3 手', function () {",
+                  "    const px = Number(pm.collectionVariables.get('px'));",
+                  "    const trades = j.events.filter(e => e.kind === 'Trade');",
+                  "    pm.expect(trades.length).to.be.above(0);",
+                  "    const filled = trades.reduce((n, t) => n + t.size, 0);",
+                  "    pm.expect(filled).to.eql(3);",
+                  "    // 价格优先：买单从最优（最低）卖价开始吃，成交价必然 <= 委托价。",
+                  "    // 簿中若存在比本次价位更便宜的卖单，会先被吃掉 —— 这是正确行为。",
+                  "    trades.forEach(t => pm.expect(t.price).to.be.at.most(px));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "减量 2 手",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/orders/{{askOrderId}}/reduce",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orders",
+                "{{askOrderId}}",
+                "reduce"
+              ]
+            },
+            "description": "减少挂单的剩余数量，按实际减少量退还冻结资金（`Reduce` 事件）。\n\n部分减量时订单**保留原有排队位次**——时间优先不会因减量而丢失。\n减到 0 等同于撤单。",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"uid\": {{sellerUid}},\n  \"symbol\": {{symbol}},\n  \"size\": 2\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('命令被受理', function () {",
+                  "    const allowed = [];",
+                  "    if (!j.accepted && allowed.indexOf(j.result_code) < 0) {",
+                  "        pm.expect.fail('result_code = ' + j.result_code);",
+                  "    }",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "撤单（退回剩余）",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/orders/{{askOrderId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orders",
+                "{{askOrderId}}"
+              ]
+            },
+            "description": "撤销挂单，未成交部分的冻结资金原样退回（`Reject` 事件）。\n\n`uid` 与订单实际所有者不符时返回 `MatchingUnknownOrderId`——刻意不区分「不存在」与「无权限」，避免泄露订单是否存在。",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"uid\": {{sellerUid}},\n  \"symbol\": {{symbol}}\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('命令被受理', function () {",
+                  "    const allowed = [];",
+                  "    if (!j.accepted && allowed.indexOf(j.result_code) < 0) {",
+                  "        pm.expect.fail('result_code = ' + j.result_code);",
+                  "    }",
+                  "});",
+                  "pm.test('产生退款事件', function () {",
+                  "    const rej = j.events.filter(e => e.kind === 'Reject');",
+                  "    pm.expect(rej.length).to.be.above(0);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "查盘口（本次价位应消失）",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/depth?symbol={{symbol}}&limit=10",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "depth"
+              ],
+              "query": [
+                {
+                  "key": "symbol",
+                  "value": "{{symbol}}"
+                },
+                {
+                  "key": "limit",
+                  "value": "10"
+                }
+              ]
+            },
+            "description": ""
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "const px = Number(pm.collectionVariables.get('px'));",
+                  "pm.test('本次挂单的价位已从盘口消失', function () {",
+                  "    pm.expect(j.asks.find(a => a.price === px)).to.be.undefined;",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "03 · 边界与错误码",
+      "item": [
+        {
+          "name": "不支持的订单类型（应被拒且退款）",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/orders",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orders"
+              ]
+            },
+            "description": "引擎只支持 gtc / ioc / fok_budget。此处 `iceberg` 会在服务层被拒（400）。\n\n注：若绕过服务层直接投给引擎，会返回 `MatchingUnsupportedCommand`，且 R1 冻结的资金由撮合层补发的 Reject 事件退回，不会被永久锁死。",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"uid\": {{buyerUid}},\n  \"order_id\": 999000001,\n  \"symbol\": {{symbol}},\n  \"price\": 100,\n  \"size\": 1,\n  \"side\": \"buy\",\n  \"order_type\": \"iceberg\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('返回 400', () => pm.response.to.have.status(400));",
+                  "const j = pm.response.json();",
+                  "pm.test('给出可读原因', () => pm.expect(j.error).to.include('gtc'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "重复流水号（应被幂等忽略）",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/balances",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "balances"
+              ]
+            },
+            "description": "`transaction_id=1` 必然小于该用户已用过的时间戳流水号，因此被幂等闸门拦下，返回 `UserMgmtDuplicateTransaction`，余额不变。\n\n这正是 WAL 重放不会重复入账的原因。",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"uid\": {{sellerUid}},\n  \"currency\": {{baseCcy}},\n  \"amount\": 1,\n  \"transaction_id\": 1\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('被判为重复流水', () => pm.expect(j.result_code).to.eql('UserMgmtDuplicateTransaction'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "未注册的交易对",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/depth?symbol=9999",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "depth"
+              ],
+              "query": [
+                {
+                  "key": "symbol",
+                  "value": "9999"
+                }
+              ]
+            },
+            "description": "未通过 `SYMBOLS` 环境变量注册的交易对返回 400。"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('返回 400', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "余额不足（应被风控拒绝）",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/orders",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orders"
+              ]
+            },
+            "description": "风控（R1）在下单时冻结资金，余额不足直接返回 `RiskNsf`，不会进入撮合。",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"uid\": {{sellerUid}},\n  \"order_id\": 999000002,\n  \"symbol\": {{symbol}},\n  \"price\": 100,\n  \"size\": 999999999,\n  \"side\": \"sell\",\n  \"order_type\": \"gtc\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('风控拒绝', () => pm.expect(j.result_code).to.eql('RiskNsf'));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://127.0.0.1:8080",
+      "description": "服务地址。容器默认映射到本机 8080。"
+    },
+    {
+      "key": "symbol",
+      "value": "1",
+      "description": "交易对 id，需与服务启动时的 SYMBOLS 一致"
+    },
+    {
+      "key": "baseCcy",
+      "value": "0",
+      "description": "基础币种（卖方持有）"
+    },
+    {
+      "key": "quoteCcy",
+      "value": "1",
+      "description": "计价币种（买方持有）"
+    },
+    {
+      "key": "sellerUid",
+      "value": "1001"
+    },
+    {
+      "key": "buyerUid",
+      "value": "1002"
+    },
+    {
+      "key": "txId",
+      "value": "1",
+      "description": "由脚本自动覆盖，无需手改"
+    },
+    {
+      "key": "askOrderId",
+      "value": "1",
+      "description": "由脚本自动覆盖"
+    },
+    {
+      "key": "bidOrderId",
+      "value": "2",
+      "description": "由脚本自动覆盖"
+    },
+    {
+      "key": "lastSeq",
+      "value": "0",
+      "description": "健康检查写入"
+    }
+  ]
+}

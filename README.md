@@ -403,3 +403,24 @@ sudo systemctl daemon-reload && sudo systemctl enable --now matching-server
 unit 里几个关键项：`TimeoutStopSec=120` 给停机留足写快照的时间；
 `ProtectSystem=strict` 下文件系统只读，靠 `ReadWritePaths=/var/lib/matching` 放开数据目录；
 `CPUAffinity` 默认注释掉，需要把撮合线程钉在专用核上时解开。
+
+### Postman 接口集合
+
+`deploy/matching-server.postman_collection.json` 可直接导入 Postman（schema v2.1.0），
+含 18 个请求、4 个分组：运维、账户、交易、边界与错误码。
+
+用 Collection Runner **从上往下整份运行**——分组之间有依赖（先开户入金才能下单）。
+`order_id`、`transaction_id` 与价位由 Pre-request Script 基于时间戳生成，可反复运行不撞重复。
+
+也可以在命令行跑（会真实打到服务上并校验断言）：
+
+```bash
+npx newman run deploy/matching-server.postman_collection.json
+```
+
+集合里有两个容易踩的点已写进断言与说明：
+
+- **JSON 体里的数字字段不能加引号**。写成 `"uid": "{{sellerUid}}"` 时 Postman 替换后是
+  字符串，服务端反序列化直接返回 422。集合内统一写作 `"uid": {{sellerUid}}`。
+- **买单从最优卖价开始吃**，成交价必然不高于委托价。簿中若有更便宜的卖单会先成交，
+  因此成交对手不一定是刚挂的那张——断言只校验成交总量与价格上界。
